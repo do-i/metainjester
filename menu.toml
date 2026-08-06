@@ -1,0 +1,30 @@
+[menu]
+title = "metainjester"
+
+[[items]]
+id = "build"
+label = "Build (debug)"
+key = "b"
+command = ["cargo", "build"]
+group = "Build"
+
+[[items]]
+id = "ingest"
+label = "Ingest a base path"
+key = "i"
+command = 'read -r -p "Base path: " p && cargo run -- ingest "$p"'
+group = "Run"
+
+[[items]]
+id = "test"
+label = "Run tests"
+key = "t"
+command = ["cargo", "test"]
+group = "Quality"
+
+[[items]]
+id = "check"
+label = "Lint"
+key = "c"
+command = ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]
+group = "Quality"
