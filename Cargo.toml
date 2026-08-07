@@ -5,5 +5,9 @@ edition = "2024"
 
 [dependencies]
 ctrlc = "3.5.2"
+mime_guess = "2.0.5"
 rusqlite = "0.40.1"
+rustix = { version = "1.1.4", features = ["fs"] }
+serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.0"
+toml = "1.1.4"
