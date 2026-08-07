@@ -128,7 +128,7 @@ fn run() -> Result<i32, AppError> {
 
     let opened = db::discover(&config)?;
     let mut conn = opened.conn;
-    db::ensure_schema(&conn)?;
+    db::ensure_schema(&conn, &opened.path)?;
     db::acquire_writer_lock(&conn)?;
 
     let result = scan::ingest(&mut conn, &opened.path, &config, &base, &cancelled);

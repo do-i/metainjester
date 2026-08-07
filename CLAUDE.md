@@ -53,7 +53,7 @@ Exit codes: `0` ok, `1` error/partial, `2` usage, `3` config, `4` busy,
 ### Schema v1
 
 ```sql
-application_metadata(key, value)          -- application_id, schema_version
+application_metadata(key, value)          -- application_id, schema_version = 2
 writer_lock(id, pid, acquired_at_ns)
 bases(base_id, base_path, created_at_ns, last_complete_scan_id,
       skip_hidden, skip_mount_boundaries, follow_symlinks, last_error)
@@ -103,6 +103,8 @@ content sniffing, always-hash policy.
   the user verifies behavior.
 - Keep replies and files short. Reading is the user's bottleneck.
 - One-line git commit messages, no trailers.
-- Schema changes just recreate the database; no migrations yet. A version
-  mismatch refuses to open rather than guessing.
+- Schema changes just recreate the database; no migrations yet. **Bump
+  `SCHEMA_VERSION` in `db.rs` on every schema change** — `CREATE TABLE IF NOT
+  EXISTS` cannot add a column to an existing table, so without the bump an older
+  database fails later on a missing column instead of refusing up front.
 - `lazymenu-cli` is installed; `menu.toml` drives build/ingest/test/lint.

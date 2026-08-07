@@ -245,16 +245,18 @@ pub fn ingest(
     let stopped = cancelled.load(Ordering::SeqCst);
     let errors = pipeline.errors;
 
-    let staged: usize = conn
+    let (staged, staged_bytes): (usize, i64) = conn
         .query_row(
-            "SELECT COUNT(*) FROM scan_stage_entries WHERE scan_id = ?1 AND complete = 1",
+            "SELECT COUNT(*), IFNULL(SUM(size_bytes), 0) FROM scan_stage_entries
+             WHERE scan_id = ?1 AND complete = 1",
             params![scan_id],
-            |r| r.get::<_, i64>(0).map(|n| n as usize),
+            |r| Ok((r.get::<_, i64>(0)? as usize, r.get(1)?)),
         )
         .map_err(AppError::db)?;
 
     conn.execute(
         "UPDATE scans SET discovered_files = ?1, discovered_bytes = ?2, staged_files = ?3,
+             staged_bytes = ?12,
              hashed_files = ?4, hashed_bytes = ?5, changed_during_hash = ?6,
              excluded_hidden = ?7, excluded_mount = ?8, excluded_symlink = ?9,
              error_count = ?10
@@ -270,7 +272,8 @@ pub fn ingest(
             counts.mount.load(Ordering::Relaxed) as i64,
             counts.symlink.load(Ordering::Relaxed) as i64,
             errors as i64,
-            scan_id
+            scan_id,
+            staged_bytes
         ],
     )
     .map_err(AppError::db)?;

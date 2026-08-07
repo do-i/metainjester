@@ -9,7 +9,7 @@ use crate::AppError;
 
 pub const CWD_DB: &str = "metainjester.sqlite3";
 pub const APPLICATION_ID: &str = "metainjester";
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "2";
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS application_metadata (
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS bases (
     base_id   INTEGER PRIMARY KEY,
     base_path TEXT NOT NULL UNIQUE,
     created_at_ns INTEGER NOT NULL,
-    last_complete_scan_id INTEGER,
+    last_complete_scan_id INTEGER REFERENCES scans(scan_id),
     skip_hidden            INTEGER NOT NULL,
     skip_mount_boundaries  INTEGER NOT NULL,
     follow_symlinks        INTEGER NOT NULL,
@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS bases (
 CREATE TABLE IF NOT EXISTS scans (
     scan_id          INTEGER PRIMARY KEY,
     base_id          INTEGER NOT NULL REFERENCES bases(base_id),
-    baseline_scan_id INTEGER,
+    baseline_scan_id INTEGER REFERENCES scans(scan_id),
     status           TEXT NOT NULL,
     started_at_ns    INTEGER NOT NULL,
     finished_at_ns   INTEGER,
@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS scans (
     discovered_files   INTEGER NOT NULL DEFAULT 0,
     discovered_bytes   INTEGER NOT NULL DEFAULT 0,
     staged_files       INTEGER NOT NULL DEFAULT 0,
+    staged_bytes       INTEGER NOT NULL DEFAULT 0,
     hashed_files       INTEGER NOT NULL DEFAULT 0,
     hashed_bytes       INTEGER NOT NULL DEFAULT 0,
     changed_during_hash INTEGER NOT NULL DEFAULT 0,
@@ -84,8 +85,8 @@ CREATE TABLE IF NOT EXISTS files (
     hash_algorithm TEXT NOT NULL,
     content_hash   BLOB NOT NULL,
     hash_status    TEXT NOT NULL,
-    metadata_from_scan_id INTEGER NOT NULL,
-    deleted_in_scan_id    INTEGER,
+    metadata_from_scan_id INTEGER NOT NULL REFERENCES scans(scan_id),
+    deleted_in_scan_id    INTEGER REFERENCES scans(scan_id),
     UNIQUE(base_id, relative_path),
     CHECK (hash_status <> 'complete' OR hash_algorithm <> 'sha256'
            OR length(content_hash) = 32)
@@ -95,8 +96,8 @@ CREATE INDEX IF NOT EXISTS files_by_base_name      ON files(base_id, name);
 CREATE INDEX IF NOT EXISTS files_by_base_extension ON files(base_id, extension);
 CREATE INDEX IF NOT EXISTS files_by_base_mime      ON files(base_id, mime_type);
 CREATE TABLE IF NOT EXISTS scan_stage_entries (
-    scan_id       INTEGER NOT NULL,
-    base_id       INTEGER NOT NULL,
+    scan_id       INTEGER NOT NULL REFERENCES scans(scan_id),
+    base_id       INTEGER NOT NULL REFERENCES bases(base_id),
     relative_path BLOB NOT NULL,
     parent_path   TEXT,
     name          TEXT,
@@ -114,8 +115,8 @@ CREATE TABLE IF NOT EXISTS scan_stage_entries (
 );
 CREATE TABLE IF NOT EXISTS scan_changes (
     change_id     INTEGER PRIMARY KEY,
-    scan_id       INTEGER NOT NULL,
-    base_id       INTEGER NOT NULL,
+    scan_id       INTEGER NOT NULL REFERENCES scans(scan_id),
+    base_id       INTEGER NOT NULL REFERENCES bases(base_id),
     relative_path BLOB NOT NULL,
     change_kind   TEXT NOT NULL,
     field_mask    INTEGER NOT NULL,
@@ -131,7 +132,7 @@ CREATE TABLE IF NOT EXISTS scan_changes (
 CREATE INDEX IF NOT EXISTS scan_changes_by_scan ON scan_changes(scan_id, change_kind);
 CREATE TABLE IF NOT EXISTS scan_errors (
     error_id      INTEGER PRIMARY KEY,
-    scan_id       INTEGER NOT NULL,
+    scan_id       INTEGER NOT NULL REFERENCES scans(scan_id),
     relative_path BLOB,
     stage         TEXT NOT NULL,
     error_code    TEXT NOT NULL,
@@ -286,7 +287,10 @@ fn init(conn: &Connection) -> Result<(), AppError> {
 }
 
 /// Ensures the schema exists on a database we already own, and checks version.
-pub fn ensure_schema(conn: &Connection) -> Result<(), AppError> {
+/// `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that already
+/// exists, so a database from an older build must be refused loudly rather than
+/// left to fail later on a missing column.
+pub fn ensure_schema(conn: &Connection, path: &Path) -> Result<(), AppError> {
     conn.execute_batch(SCHEMA).map_err(AppError::db)?;
     let version: Option<String> = conn
         .query_row(
@@ -308,8 +312,10 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), AppError> {
         }
         Some(SCHEMA_VERSION) => Ok(()),
         Some(other) => Err(AppError::config(format!(
-            "database schema_version {other} is not supported (expected {SCHEMA_VERSION}); \
-             this POC has no migrations — recreate the database"
+            "database schema_version is {other}, this build needs {SCHEMA_VERSION}.\n  \
+             this POC has no migrations yet — delete the database and ingest again:\n  \
+             rm {}*",
+            path.display()
         ))),
     }
 }
