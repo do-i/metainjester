@@ -97,6 +97,21 @@ Nothing is planned — waiting on the user's testing, then delta updates.
 Post-MVP in the design: `history prune`, `status`, `doctor`, rename detection,
 content sniffing, always-hash policy.
 
+## Packaging
+
+`packaging/arch/PKGBUILD` plus `bitbucket-pipelines.yml` build an Arch package
+(`.pkg.tar.zst`) in an `archlinux:base-devel` container, on a `v*` tag or on
+demand. The pipeline generates the source tarball with `git archive`, so the
+PKGBUILD needs no network fetch of its own. Verified locally with `makepkg`:
+the package installs `/usr/bin/metainjester` and links the system SQLite.
+
+The pipeline is untested on Bitbucket itself — it needs Pipelines enabled, and
+`BB_USER` / `BB_APP_PASSWORD` repository variables for the Downloads upload
+(the package is attached as a pipeline artifact regardless).
+
+**`license=('LicenseRef-UNSET')` is a placeholder.** Pick a real license and add
+a LICENSE file before publishing anywhere.
+
 ## Working rules
 
 - POC first: lean, small, just works. **No README, no tests yet** — added after
