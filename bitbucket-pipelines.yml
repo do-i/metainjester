@@ -1,13 +1,18 @@
 # Arch package build. Enable Pipelines in Repository settings > Pipelines first.
 #
-# Runs on a tag matching v* (e.g. `git tag v0.1.0 && git push --tags`), or on
-# demand from the Pipelines page via the `build-package` custom pipeline.
+# Push a tag to build and publish:
+#     git tag v0.1.0 && git push origin v0.1.0
 #
-# Repository variables needed for the Downloads upload (Repository settings >
-# Repository variables). Omit them and the build still runs — the package is
-# always attached as a pipeline artifact either way.
+# The tag version must match `version` in Cargo.toml, or the build fails rather
+# than shipping a package whose name disagrees with what it contains.
+#
+# Repository variables (Repository settings > Repository variables), required
+# for tag builds because a release nobody can download is a failed release:
 #   BB_USER          Bitbucket username (not the email address)
 #   BB_APP_PASSWORD  App password with the `repository:write` scope, marked Secured
+#
+# The `build-package` custom pipeline runs the same build without publishing,
+# for checking packaging changes before tagging.
 
 image: archlinux:base-devel
 
@@ -16,38 +21,63 @@ definitions:
     - step: &build-arch
         name: Build Arch package
         script:
-          # The base-devel image ships no keyring refresh; -Syu keeps it current.
+          # `rust` provides cargo, which is the PKGBUILD's makedepends entry.
           - pacman -Syu --noconfirm --needed rust sqlite git
-          # A tag build takes its version from the tag; anything else uses Cargo.toml.
           - |
-            if [ -n "$BITBUCKET_TAG" ]; then
+            set -euo pipefail
+            CARGO_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+            if [ -n "${BITBUCKET_TAG:-}" ]; then
               VER="${BITBUCKET_TAG#v}"
+              if [ "$VER" != "$CARGO_VER" ]; then
+                echo "tag $BITBUCKET_TAG implies version $VER, but Cargo.toml says $CARGO_VER."
+                echo "bump Cargo.toml and re-tag, so the package matches its contents."
+                exit 1
+              fi
+              if [ -z "${BB_APP_PASSWORD:-}" ] || [ -z "${BB_USER:-}" ]; then
+                echo "this is a tag build, but BB_USER / BB_APP_PASSWORD are unset."
+                echo "without them the package cannot reach the Downloads page."
+                echo "set them in Repository settings > Repository variables."
+                exit 1
+              fi
             else
-              VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+              VER="$CARGO_VER"
             fi
-            echo "building $VER"
+            echo "$VER" > .build-version
+            echo "building metainjester $VER"
           # makepkg refuses to run as root, so build as an unprivileged user.
-          - useradd -m builder
-          - mkdir -p /build && cp packaging/arch/PKGBUILD /build/
-          - git archive --format=tar.gz --prefix="metainjester-$VER/" -o "/build/metainjester-$VER.tar.gz" HEAD
-          - sed -i "s/^pkgver=.*/pkgver=$VER/" /build/PKGBUILD
-          - chown -R builder:builder /build
-          - su builder -c 'cd /build && makepkg -f --noconfirm'
-          - mkdir -p dist && cp /build/*.pkg.tar.zst dist/
-          - ls -la dist/
-          # Upload to the repository Downloads page when credentials are present.
           - |
-            if [ -n "$BB_APP_PASSWORD" ]; then
-              for f in dist/*.pkg.tar.zst; do
-                echo "uploading $f"
-                curl -sS --fail -X POST \
-                  -u "$BB_USER:$BB_APP_PASSWORD" \
-                  "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/downloads" \
-                  -F files=@"$f"
-              done
-            else
-              echo "BB_APP_PASSWORD unset — skipping Downloads upload"
+            set -euo pipefail
+            VER=$(cat .build-version)
+            useradd -m builder
+            mkdir -p /build
+            cp packaging/arch/PKGBUILD /build/
+            sed -i "s/^pkgver=.*/pkgver=$VER/" /build/PKGBUILD
+            git archive --format=tar.gz --prefix="metainjester-$VER/" \
+              -o "/build/metainjester-$VER.tar.gz" HEAD
+            chown -R builder:builder /build
+            su builder -c 'cd /build && makepkg -f --noconfirm'
+          - |
+            set -euo pipefail
+            mkdir -p dist
+            cp /build/*.pkg.tar.zst dist/
+            cd dist && sha256sum *.pkg.tar.zst > SHA256SUMS && cd ..
+            ls -la dist/
+            cat dist/SHA256SUMS
+          # Publish to the repository Downloads page on tag builds.
+          - |
+            set -euo pipefail
+            if [ -z "${BITBUCKET_TAG:-}" ]; then
+              echo "not a tag build — package left as a pipeline artifact only"
+              exit 0
             fi
+            for f in dist/*.pkg.tar.zst dist/SHA256SUMS; do
+              echo "uploading $f"
+              curl -sS --fail-with-body -X POST \
+                -u "$BB_USER:$BB_APP_PASSWORD" \
+                "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/downloads" \
+                -F files=@"$f"
+            done
+            echo "published to https://bitbucket.org/$BITBUCKET_REPO_FULL_NAME/downloads/"
         artifacts:
           - dist/**
 
