@@ -1,28 +1,31 @@
-# Arch package build. Enable Pipelines in Repository settings > Pipelines first.
+# Arch package build and hosted pacman repository.
+# Enable Pipelines in Repository settings > Pipelines first.
 #
-# Push a tag to build and publish:
-#     git tag v0.1.0 && git push origin v0.1.0
+# Release:
+#     bump `version` in Cargo.toml to year.month.sequence  (e.g. 2026.8.1)
+#     git commit && git tag 2026.8.1 && git push origin main --tags
 #
-# The tag version must match `version` in Cargo.toml, or the build fails rather
-# than shipping a package whose name disagrees with what it contains.
+# The tag must equal `version` in Cargo.toml, or the build fails rather than
+# shipping a package whose name disagrees with what it contains.
 #
 # Repository variables (Repository settings > Repository variables), required
 # for tag builds because a release nobody can download is a failed release:
 #   BB_USER          Bitbucket username (not the email address)
 #   BB_APP_PASSWORD  App password with the `repository:write` scope, marked Secured
 #
-# The `build-package` custom pipeline runs the same build without publishing,
-# for checking packaging changes before tagging.
+# The repository must be PUBLIC for pacman to fetch without credentials.
+#
+# The `build-package` custom pipeline runs the same build without publishing.
 
 image: archlinux:base-devel
 
 definitions:
   steps:
     - step: &build-arch
-        name: Build Arch package
+        name: Build Arch package and update pacman repo
         script:
           # `rust` provides cargo, which is the PKGBUILD's makedepends entry.
-          - pacman -Syu --noconfirm --needed rust sqlite git
+          - pacman -Syu --noconfirm --needed rust sqlite git curl
           - |
             set -euo pipefail
             CARGO_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -56,34 +59,59 @@ definitions:
               -o "/build/metainjester-$VER.tar.gz" HEAD
             chown -R builder:builder /build
             su builder -c 'cd /build && makepkg -f --noconfirm'
-          - |
-            set -euo pipefail
             mkdir -p dist
             cp /build/*.pkg.tar.zst dist/
-            cd dist && sha256sum *.pkg.tar.zst > SHA256SUMS && cd ..
             ls -la dist/
-            cat dist/SHA256SUMS
-          # Publish to the repository Downloads page on tag builds.
+          # Rebuild the pacman repo database, carrying forward earlier releases.
+          # `repo-add` writes <repo>.db.tar.gz; pacman fetches it as <repo>.db,
+          # which is normally a symlink. Downloads cannot hold a symlink, so the
+          # resolved tarball is uploaded under the plain name instead.
+          - |
+            set -euo pipefail
+            cd dist
+            API="https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/downloads"
+            if [ -n "${BB_APP_PASSWORD:-}" ]; then
+              echo "fetching existing repo database, if any"
+              curl -sSL -u "$BB_USER:$BB_APP_PASSWORD" -o metainjester.db.tar.gz \
+                "$API/metainjester.db" || true
+              if [ -s metainjester.db.tar.gz ] && tar -tzf metainjester.db.tar.gz >/dev/null 2>&1; then
+                echo "existing database carried forward"
+              else
+                echo "no usable existing database; starting a new one"
+                rm -f metainjester.db.tar.gz
+              fi
+            fi
+            repo-add metainjester.db.tar.gz ./*.pkg.tar.zst
+            cp -L metainjester.db.tar.gz metainjester.db
+            cp -L metainjester.files.tar.gz metainjester.files
+            sha256sum ./*.pkg.tar.zst metainjester.db > SHA256SUMS
+            ls -la
+            echo "--- packages now in the repo database ---"
+            tar -tzf metainjester.db | sed -n 's|/$||p'
           - |
             set -euo pipefail
             if [ -z "${BITBUCKET_TAG:-}" ]; then
-              echo "not a tag build — package left as a pipeline artifact only"
+              echo "not a tag build — artifacts only, nothing published"
               exit 0
             fi
-            for f in dist/*.pkg.tar.zst dist/SHA256SUMS; do
+            API="https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/downloads"
+            cd dist
+            for f in ./*.pkg.tar.zst metainjester.db metainjester.files SHA256SUMS; do
               echo "uploading $f"
-              curl -sS --fail-with-body -X POST \
-                -u "$BB_USER:$BB_APP_PASSWORD" \
-                "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/downloads" \
-                -F files=@"$f"
+              curl -sS --fail-with-body -X POST -u "$BB_USER:$BB_APP_PASSWORD" \
+                "$API" -F files=@"$f"
             done
-            echo "published to https://bitbucket.org/$BITBUCKET_REPO_FULL_NAME/downloads/"
+            echo
+            echo "published. add to /etc/pacman.conf:"
+            echo "  [metainjester]"
+            echo "  SigLevel = Optional TrustAll"
+            echo "  Server = https://bitbucket.org/$BITBUCKET_REPO_FULL_NAME/downloads"
         artifacts:
           - dist/**
 
 pipelines:
   tags:
-    'v*':
+    '20*.*.*':
       - step: *build-arch
   custom:
     build-package:

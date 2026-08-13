@@ -1,15 +1,16 @@
-# Maintainer: Ninja <joji.doi+claude@gmail.com>
+# Maintainer: Ninja <ninja@renton.net>
 pkgname=metainjester
-pkgver=0.1.0
+pkgver=2026.8.1
 pkgrel=1
 pkgdesc="Catalogues a directory tree into SQLite and reports what changed on later runs"
 arch=('x86_64')
 url="https://bitbucket.org/do-i/metainjester"
-# TODO: unset. Pick a real license and add a matching LICENSE file before publishing.
-license=('LicenseRef-UNSET')
+license=('MIT')
 # rusqlite links the system SQLite rather than bundling it, per design §3.
 depends=('sqlite' 'gcc-libs' 'glibc')
 makedepends=('cargo')
+# One package per release keeps the hosted pacman repo simple.
+options=('!debug')
 source=("$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')
 
@@ -36,4 +37,6 @@ check() {
 package() {
     cd "$pkgname-$pkgver"
     install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/$pkgname"
+    # MIT is a per-package licence text, so Arch expects a copy shipped.
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

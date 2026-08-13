@@ -1,7 +1,11 @@
 [package]
 name = "metainjester"
-version = "0.1.0"
+# Calendar versioning: year.month.sequence. The release tag must match exactly.
+version = "2026.8.1"
 edition = "2024"
+description = "Catalogues a directory tree into SQLite and reports what changed on later runs"
+license = "MIT"
+repository = "https://bitbucket.org/do-i/metainjester"
 
 [dependencies]
 ctrlc = "3.5.2"
