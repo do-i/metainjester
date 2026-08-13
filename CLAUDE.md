@@ -100,20 +100,35 @@ content sniffing, always-hash policy.
 ## Packaging
 
 `packaging/arch/PKGBUILD` plus `bitbucket-pipelines.yml` build an Arch package
-(`.pkg.tar.zst`) in an `archlinux:base-devel` container, on a `v*` tag or on
-demand. The pipeline generates the source tarball with `git archive`, so the
-PKGBUILD needs no network fetch of its own. Verified locally with `makepkg`:
-the package installs `/usr/bin/metainjester` and links the system SQLite.
+in an `archlinux:base-devel` container and publish a **pacman repository** to
+the Bitbucket Downloads page, on a `20*.*.*` tag or on demand.
 
-Tag builds are guarded: the tag version must equal `version` in Cargo.toml, and
-`BB_USER` / `BB_APP_PASSWORD` must be set, or the build fails rather than going
-green without publishing anything. Both guards are exercised locally. The
-pipeline itself is untested on Bitbucket — it needs Pipelines enabled first.
+Versioning is calendar-based: `year.month.sequence` (e.g. `2026.8.1`), and the
+tag must equal `version` in Cargo.toml or the build fails. Licence is MIT, with
+the text shipped to `/usr/share/licenses/metainjester/`.
 
-Release: bump Cargo.toml, commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+Release: bump Cargo.toml, commit, `git tag 2026.8.N && git push origin main --tags`.
 
-**`license=('LicenseRef-UNSET')` is a placeholder.** Pick a real license and add
-a LICENSE file before publishing anywhere.
+Consumers add to `/etc/pacman.conf`:
+
+```ini
+[metainjester]
+SigLevel = Optional TrustAll
+Server = https://bitbucket.org/do-i/metainjester/downloads
+```
+
+A pacman repo lists one version per package name — `repo-add` replaces the
+previous entry rather than accumulating. Older `.pkg.tar.zst` files stay on the
+Downloads page for a manual `pacman -U`.
+
+Verified locally end to end: `makepkg` builds the package, `repo-add` builds the
+database, a real `pacman -Sy` / `-Sl` / `-Si` / `-S` against a `file://` copy
+installs it into an isolated root and runs, and a second release is offered as
+`2026.8.1 -> 2026.8.2`. Only the container steps and the Downloads upload are
+unverified — they need Pipelines enabled and cannot run locally.
+
+**The Bitbucket repository must be public** for pacman to fetch without
+credentials, and packages are unsigned (`SigLevel = Optional TrustAll`).
 
 ## Working rules
 

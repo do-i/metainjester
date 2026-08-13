@@ -62,10 +62,17 @@ definitions:
             mkdir -p dist
             cp /build/*.pkg.tar.zst dist/
             ls -la dist/
-          # Rebuild the pacman repo database, carrying forward earlier releases.
-          # `repo-add` writes <repo>.db.tar.gz; pacman fetches it as <repo>.db,
-          # which is normally a symlink. Downloads cannot hold a symlink, so the
-          # resolved tarball is uploaded under the plain name instead.
+          # Update the pacman repo database.
+          #
+          # A pacman repo lists exactly one version per package name: repo-add
+          # replaces the previous metainjester entry rather than accumulating.
+          # Older .pkg.tar.zst files stay on the Downloads page for a manual
+          # `pacman -U`. Fetching the existing database still matters the day a
+          # second package ships from this repo, so its entry is not dropped.
+          #
+          # repo-add writes <repo>.db.tar.gz and a <repo>.db symlink. pacman
+          # fetches <repo>.db, and Downloads cannot store a symlink, so the
+          # resolved tarball is staged under the plain name.
           - |
             set -euo pipefail
             cd dist
@@ -75,18 +82,23 @@ definitions:
               curl -sSL -u "$BB_USER:$BB_APP_PASSWORD" -o metainjester.db.tar.gz \
                 "$API/metainjester.db" || true
               if [ -s metainjester.db.tar.gz ] && tar -tzf metainjester.db.tar.gz >/dev/null 2>&1; then
-                echo "existing database carried forward"
+                echo "existing database reused"
               else
                 echo "no usable existing database; starting a new one"
                 rm -f metainjester.db.tar.gz
               fi
             fi
             repo-add metainjester.db.tar.gz ./*.pkg.tar.zst
-            cp -L metainjester.db.tar.gz metainjester.db
-            cp -L metainjester.files.tar.gz metainjester.files
+            # Stage in a separate directory: copying a symlink onto its own
+            # target in place fails with "same file".
+            mkdir -p upload
+            cp ./*.pkg.tar.zst upload/
+            cp -L metainjester.db upload/metainjester.db
+            cp -L metainjester.files upload/metainjester.files
+            cd upload
             sha256sum ./*.pkg.tar.zst metainjester.db > SHA256SUMS
             ls -la
-            echo "--- packages now in the repo database ---"
+            echo "--- packages in the repo database ---"
             tar -tzf metainjester.db | sed -n 's|/$||p'
           - |
             set -euo pipefail
@@ -95,7 +107,7 @@ definitions:
               exit 0
             fi
             API="https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/downloads"
-            cd dist
+            cd dist/upload
             for f in ./*.pkg.tar.zst metainjester.db metainjester.files SHA256SUMS; do
               echo "uploading $f"
               curl -sS --fail-with-body -X POST -u "$BB_USER:$BB_APP_PASSWORD" \
