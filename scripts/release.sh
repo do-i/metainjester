@@ -188,6 +188,14 @@ check_ci_status() {
         echo "Install gh, or pass --skip-ci-check to override." >&2
         exit 1
     fi
+    # An unauthenticated gh returns nothing, which the poll loop below would
+    # read as "the run has not started yet" and then wait out the full timeout.
+    # Fail immediately instead: no run will ever appear.
+    if ! gh auth status &>/dev/null; then
+        echo "error: gh is not authenticated; cannot verify CI status for $sha." >&2
+        echo "Run 'gh auth login', or pass --skip-ci-check to override." >&2
+        exit 1
+    fi
 
     local waited=0 state status conclusion
     while true; do
