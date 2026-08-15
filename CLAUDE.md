@@ -146,15 +146,22 @@ fetches. GitHub Pages runs Jekyll in safe mode and **ignores symlinks**, so the
 workflow replaces them with resolved copies and writes `.nojekyll`. Without
 that, every `pacman -Sy` 404s.
 
-Verified locally end to end on the gh-pages layout: the workflow's own build
-sequence produces the package, `repo-add` builds the database, and a real
-`pacman -Sy` / `-Sl` / `-Si` / `-S` against a `file://` copy (with `$arch`
-expanding) installs it into an isolated root and runs it; a second release is
-offered as `2026.8.1 -> 2026.8.2` with both files retained. Unverified: the
-Actions run itself, the release upload, and Pages serving — they need the repo
-to exist.
+Verified locally on the gh-pages layout: a real `pacman -Sy` / `-Sl` / `-Si` /
+`-S` against a `file://` copy (with `$arch` expanding) installs into an isolated
+root and runs; a second release is offered as `2026.8.1 -> 2026.8.2` with both
+package files retained.
 
-**One-time setup:** repo public, and Pages enabled with `gh-pages` as source.
+Verified on GitHub with the `v2026.8.1` release: `checks.yml` green on main and
+develop, `arch-package.yml` green, the package attached to the release, and
+`gh-pages` published with `metainjester.db` as a **regular file** (mode 100644,
+not a symlink) plus `.nojekyll`.
+
+Still unverified: Pages actually serving. `has_pages` is false, so
+`https://do-i.github.io/metainjester/arch/x86_64/metainjester.db` 404s and no
+`pacman -Sy` can succeed until Pages is enabled.
+
+**One-time setup:** repo public (done), and Pages enabled with `gh-pages` as
+source (Settings > Pages > Deploy from a branch > gh-pages > / (root)).
 Packages are unsigned (`SigLevel = Optional TrustAll`).
 
 ## Working rules
