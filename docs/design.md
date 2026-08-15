@@ -1,8 +1,7 @@
 # metainjester design
 
-Migrated from `cms/docs` (007 + deltas). Implementation detail lives in
-`CLAUDE.md` and the code; this file keeps the intent, the invariants worth not
-breaking, and what is still open.
+Implementation detail lives in `CLAUDE.md` and the code; this file keeps the
+intent, the invariants worth not breaking, and what is still open.
 
 ## Product
 

@@ -1,10 +1,9 @@
 # metainjester
 
 Rust CLI that catalogues a directory tree into SQLite and reports what changed
-on later runs. Design doc: `../../bitbucket/cms/docs/2026-07-26-007.md` plus
-dated deltas in that directory — cms stayed under `ws/bitbucket/` when this
-repo moved to `ws/github/`. Those docs are **immutable** — record changes as a
-new `YYYY-MM-DD-NNN.md` delta there, a few lines, never an edit.
+on later runs. Design doc: `docs/design.md` — intent, invariants, and what is
+still open. It is version-controlled, so git history replaces the old
+dated-delta scheme; edit it in place and keep the diff small.
 
 ## State
 
@@ -12,8 +11,8 @@ MVP complete and unverified by the user. Steps 1-3 (`3de78b6`, `264cc6d`,
 `fab5dac`) built ingest, the rescan diff, and staged/atomic/resumable scans.
 The current commit adds the rest of the design: configuration, database
 discovery, inclusion policy, MIME, worker pipeline, free-space preflight,
-`scan_errors`, and progress. Implementation deviations are recorded in
-`2026-08-06-002.md`; the GitHub move in `2026-08-14-001.md`.
+`scan_errors`, and progress. Where the build departs from the design, the
+reason is noted in `docs/design.md`.
 
 ```text
 metainjester ingest <base-path>      # the entire command surface
@@ -100,10 +99,9 @@ content sniffing, always-hash policy.
 
 ## Packaging
 
-Hosted on **GitHub** (`do-i/metainjester`), following thumbgrid. Bitbucket was
-dropped: its Pipelines inject no credential that can write to their own repo, so
-publishing needed a hand-made app password, while Actions supply `GITHUB_TOKEN`
-automatically. **The release path has no secrets to manage.**
+Hosted on **GitHub** (`do-i/metainjester`), following thumbgrid. Actions supply
+`GITHUB_TOKEN` to every run, so **the release path has no secrets to manage** —
+nothing to create, store, or rotate.
 
 - `.github/workflows/checks.yml` — build, clippy, `cargo test` on develop/main
   and PRs. This is the gate `release.sh` requires before it will tag.
