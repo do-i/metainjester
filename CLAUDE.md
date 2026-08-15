@@ -156,13 +156,15 @@ develop, `arch-package.yml` green, the package attached to the release, and
 `gh-pages` published with `metainjester.db` as a **regular file** (mode 100644,
 not a symlink) plus `.nojekyll`.
 
-Still unverified: Pages actually serving. `has_pages` is false, so
-`https://do-i.github.io/metainjester/arch/x86_64/metainjester.db` 404s and no
-`pacman -Sy` can succeed until Pages is enabled.
+Verified against the live Pages URL, which is the whole chain end to end: a real
+`pacman -Sy` / `-Sl` / `-Si` / `-S` over
+`https://do-i.github.io/metainjester/arch/$arch` installs 2026.8.1-1 into an
+isolated root, and the downloaded binary runs. The fetched package is byte-identical
+to the release asset (486,253 bytes). Nothing about the release path is
+unverified now.
 
-**One-time setup:** repo public (done), and Pages enabled with `gh-pages` as
-source (Settings > Pages > Deploy from a branch > gh-pages > / (root)).
-Packages are unsigned (`SigLevel = Optional TrustAll`).
+**One-time setup, both done:** repo public, Pages serving `gh-pages` at
+`/ (root)`. Packages are unsigned (`SigLevel = Optional TrustAll`).
 
 ## Working rules
 
