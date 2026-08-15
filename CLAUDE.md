@@ -1,9 +1,10 @@
 # metainjester
 
 Rust CLI that catalogues a directory tree into SQLite and reports what changed
-on later runs. Design doc: `../cms/docs/2026-07-26-007.md` plus dated deltas in
-that directory. Those docs are **immutable** — record changes as a new
-`docs/YYYY-MM-DD-NNN.md` delta, a few lines, never an edit.
+on later runs. Design doc: `../../bitbucket/cms/docs/2026-07-26-007.md` plus
+dated deltas in that directory — cms stayed under `ws/bitbucket/` when this
+repo moved to `ws/github/`. Those docs are **immutable** — record changes as a
+new `YYYY-MM-DD-NNN.md` delta there, a few lines, never an edit.
 
 ## State
 
@@ -12,7 +13,7 @@ MVP complete and unverified by the user. Steps 1-3 (`3de78b6`, `264cc6d`,
 The current commit adds the rest of the design: configuration, database
 discovery, inclusion policy, MIME, worker pipeline, free-space preflight,
 `scan_errors`, and progress. Implementation deviations are recorded in
-`../cms/docs/2026-08-06-002.md`.
+`2026-08-06-002.md`; the GitHub move in `2026-08-14-001.md`.
 
 ```text
 metainjester ingest <base-path>      # the entire command surface
