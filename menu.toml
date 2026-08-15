@@ -28,3 +28,21 @@ label = "Lint"
 key = "c"
 command = ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]
 group = "Quality"
+
+[[items]]
+id = "release-status"
+label = "Step 0 - Check release status (changes nothing)"
+key = "s"
+command = ["scripts/release.sh", "status"]
+group = "Release"
+tags = ["status", "version", "tag", "develop", "main", "state"]
+description = "Show origin develop/main state, unreleased commits, the Cargo.toml version and the next auto version; changes nothing"
+
+[[items]]
+id = "release-cut"
+label = "Step 1 - Cut release (bump, tag main, start the CI build)"
+key = "e"
+command = ["scripts/release.sh", "cut"]
+group = "Release"
+tags = ["tag", "version", "cut", "publish", "develop", "main"]
+description = "Bump Cargo.toml on develop, wait for CI, fast-forward main and push the tag atomically. The tag starts arch-package.yml, which builds the package and refreshes the pacman repo"

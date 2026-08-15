@@ -1,0 +1,179 @@
+name: Arch package
+
+# Build the Arch package on a version tag, attach it to the GitHub release, and
+# publish/refresh the pacman repository served from gh-pages (arch/x86_64/).
+#
+# Release:
+#     scripts/release.sh cut          (or the "Cut release" entry in menu.toml)
+#
+# Also runnable manually (workflow_dispatch) with a bumped pkgrel to republish
+# an ABI-only rebuild — metainjester links the system SQLite, so an sqlite
+# soname bump needs a rebuild without a new application version.
+#
+# No secrets: GITHUB_TOKEN is injected into every run. Enable GitHub Pages with
+# the gh-pages branch as its source once, and the repo URL below starts serving.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      pkgrel:
+        description: 'pkgrel to publish (bump for an ABI-only rebuild of the latest tag)'
+        required: false
+        default: '1'
+
+permissions:
+  contents: write   # upload release assets and push to gh-pages
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install build tooling
+        # repo-add ships with pacman itself; no pacman-contrib needed.
+        run: pacman -Syu --noconfirm --needed rust sqlite git github-cli
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # tags needed for the dispatch path's git describe
+
+      - name: Mark workspace as a safe git directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Compute and verify version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            ref="${GITHUB_REF_NAME}"
+            pkgrel="1"
+          else
+            # Manual dispatch (ABI-only rebuild): republish the latest tag with
+            # the caller-supplied pkgrel so `pacman -Syu` sees a bump.
+            ref="$(git describe --tags --abbrev=0)"
+            pkgrel="${{ github.event.inputs.pkgrel }}"
+            pkgrel="${pkgrel:-1}"
+            # actions/checkout left the dispatched branch's HEAD checked out,
+            # not this tag — building HEAD would ship newer code under the old
+            # version. Pin the worktree to the tag before anything is built.
+            git checkout "$ref"
+          fi
+          pkgver="${ref#v}"
+
+          # The tag is the release's identity, but the package is built from
+          # Cargo.toml. If they disagree, the package would claim a version it
+          # does not contain, so refuse rather than ship the discrepancy.
+          cargo_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ "$pkgver" != "$cargo_ver" ]]; then
+            echo "tag $ref implies version $pkgver, but Cargo.toml says $cargo_ver." >&2
+            echo "bump Cargo.toml and re-tag, so the package matches its contents." >&2
+            exit 1
+          fi
+
+          echo "pkgver=$pkgver" >> "$GITHUB_OUTPUT"
+          echo "pkgrel=$pkgrel" >> "$GITHUB_OUTPUT"
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+          echo "building metainjester $pkgver-$pkgrel from $ref"
+
+      # makepkg refuses to run as root, so build as an unprivileged user.
+      - name: Build package
+        id: package
+        env:
+          PKGVER: ${{ steps.ver.outputs.pkgver }}
+          PKGREL: ${{ steps.ver.outputs.pkgrel }}
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          mkdir -p /build
+          cp packaging/arch/PKGBUILD /build/
+          sed -i -e "s/^pkgver=.*/pkgver=$PKGVER/" \
+                 -e "s/^pkgrel=.*/pkgrel=$PKGREL/" /build/PKGBUILD
+          # Build from the committed tree, not a network fetch, so the package
+          # contains exactly the tagged commit.
+          git archive --format=tar.gz --prefix="metainjester-$PKGVER/" \
+            -o "/build/metainjester-$PKGVER.tar.gz" HEAD
+          chown -R builder:builder /build
+          su builder -c 'cd /build && makepkg -f --noconfirm'
+          mkdir -p dist
+          cp /build/*.pkg.tar.zst dist/
+          ls -la dist/
+
+      - name: Attach package to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # --clobber so a dispatch rebuild replaces the asset on an existing
+          # release instead of failing on the name collision.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.pkg.tar.zst --clobber
+          else
+            gh release create "$TAG" dist/*.pkg.tar.zst --generate-notes --verify-tag
+          fi
+
+      - name: Publish/refresh pacman repo (gh-pages)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PKGVER: ${{ steps.ver.outputs.pkgver }}
+          PKGREL: ${{ steps.ver.outputs.pkgrel }}
+        run: |
+          set -euo pipefail
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          repo_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          work="$(mktemp -d)"
+
+          if git ls-remote --exit-code --heads "$repo_url" gh-pages >/dev/null 2>&1; then
+            git clone --branch gh-pages --single-branch "$repo_url" "$work"
+          else
+            echo "gh-pages branch does not exist yet; creating it."
+            git clone "$repo_url" "$work"
+            git -C "$work" checkout --orphan gh-pages
+            git -C "$work" rm -rf . >/dev/null 2>&1 || true
+          fi
+          git config --global --add safe.directory "$work"
+
+          mkdir -p "$work/arch/x86_64"
+          cp dist/*.pkg.tar.zst "$work/arch/x86_64/"
+          # Old package files stay downloadable for a manual `pacman -U`, but
+          # --prevent-downgrade stops their filename order (for example .8.9
+          # sorting after .8.10) from replacing the newest database entry.
+          (cd "$work/arch/x86_64" && repo-add --prevent-downgrade metainjester.db.tar.gz ./*.pkg.tar.zst)
+
+          # repo-add leaves metainjester.db as a symlink to the tarball, and
+          # that is the exact name pacman fetches. GitHub Pages runs Jekyll in
+          # safe mode, which ignores symlinks, so the link would 404 and every
+          # `pacman -Sy` would fail. Publish resolved copies instead; .nojekyll
+          # skips Jekyll entirely, which is both faster and one less surprise.
+          (
+            cd "$work/arch/x86_64"
+            for link in metainjester.db metainjester.files; do
+              if [ -L "$link" ]; then
+                target="$(readlink "$link")"
+                rm "$link"
+                cp "$target" "$link"
+              fi
+            done
+          )
+          touch "$work/.nojekyll"
+
+          cd "$work"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No pacman repo changes to publish."
+          else
+            git commit -m "Publish metainjester ${PKGVER}-${PKGREL}"
+            git push origin gh-pages
+          fi
+
+      - name: Consumer configuration
+        run: |
+          echo "published. add to /etc/pacman.conf:"
+          echo "  [metainjester]"
+          echo "  SigLevel = Optional TrustAll"
+          echo "  Server = https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/arch/\$arch"

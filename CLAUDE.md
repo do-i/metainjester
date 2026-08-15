@@ -99,36 +99,62 @@ content sniffing, always-hash policy.
 
 ## Packaging
 
-`packaging/arch/PKGBUILD` plus `bitbucket-pipelines.yml` build an Arch package
-in an `archlinux:base-devel` container and publish a **pacman repository** to
-the Bitbucket Downloads page, on a `20*.*.*` tag or on demand.
+Hosted on **GitHub** (`do-i/metainjester`), following thumbgrid. Bitbucket was
+dropped: its Pipelines inject no credential that can write to their own repo, so
+publishing needed a hand-made app password, while Actions supply `GITHUB_TOKEN`
+automatically. **The release path has no secrets to manage.**
 
-Versioning is calendar-based: `year.month.sequence` (e.g. `2026.8.1`), and the
-tag must equal `version` in Cargo.toml or the build fails. Licence is MIT, with
-the text shipped to `/usr/share/licenses/metainjester/`.
+- `.github/workflows/checks.yml` — build, clippy, `cargo test` on develop/main
+  and PRs. This is the gate `release.sh` requires before it will tag.
+- `.github/workflows/arch-package.yml` — on a `v*` tag: build the package in
+  `archlinux:base-devel`, attach it to the GitHub release, and refresh the
+  pacman repo on `gh-pages` under `arch/x86_64/`. `workflow_dispatch` with a
+  `pkgrel` input republishes an ABI-only rebuild (metainjester links the system
+  SQLite) without a new version.
+- `scripts/release.sh` — `status` and `cut`; also in `menu.toml` under Release.
 
-Release: bump Cargo.toml, commit, `git tag 2026.8.N && git push origin main --tags`.
+Versioning is calendar-based `year.month.sequence`, tagged `v2026.8.1`. The tag
+must equal `version` in Cargo.toml or the build refuses. Licence is MIT, text
+shipped to `/usr/share/licenses/metainjester/`.
+
+### Branching
+
+`develop` is the integration branch and the only branch `cut` runs from. `main`
+never takes a direct commit — it only fast-forwards from develop, then gets
+tagged. `cut` refuses if main is not an ancestor of develop.
+
+Because the package is built from Cargo.toml (thumbgrid derives its version at
+build time instead), `cut` bumps Cargo.toml **and Cargo.lock** as its own commit
+on develop, waits for a green `checks.yml` on it, then fast-forwards and tags in
+one atomic push. The lock matters: makepkg builds `--frozen`.
 
 Consumers add to `/etc/pacman.conf`:
 
 ```ini
 [metainjester]
 SigLevel = Optional TrustAll
-Server = https://bitbucket.org/do-i/metainjester/downloads
+Server = https://do-i.github.io/metainjester/arch/$arch
 ```
 
 A pacman repo lists one version per package name — `repo-add` replaces the
-previous entry rather than accumulating. Older `.pkg.tar.zst` files stay on the
-Downloads page for a manual `pacman -U`.
+previous entry rather than accumulating. Older `.pkg.tar.zst` files stay in
+`arch/x86_64/` for a manual `pacman -U`.
 
-Verified locally end to end: `makepkg` builds the package, `repo-add` builds the
-database, a real `pacman -Sy` / `-Sl` / `-Si` / `-S` against a `file://` copy
-installs it into an isolated root and runs, and a second release is offered as
-`2026.8.1 -> 2026.8.2`. Only the container steps and the Downloads upload are
-unverified — they need Pipelines enabled and cannot run locally.
+`repo-add` leaves `<repo>.db` as a symlink, which is the exact name pacman
+fetches. GitHub Pages runs Jekyll in safe mode and **ignores symlinks**, so the
+workflow replaces them with resolved copies and writes `.nojekyll`. Without
+that, every `pacman -Sy` 404s.
 
-**The Bitbucket repository must be public** for pacman to fetch without
-credentials, and packages are unsigned (`SigLevel = Optional TrustAll`).
+Verified locally end to end on the gh-pages layout: the workflow's own build
+sequence produces the package, `repo-add` builds the database, and a real
+`pacman -Sy` / `-Sl` / `-Si` / `-S` against a `file://` copy (with `$arch`
+expanding) installs it into an isolated root and runs it; a second release is
+offered as `2026.8.1 -> 2026.8.2` with both files retained. Unverified: the
+Actions run itself, the release upload, and Pages serving — they need the repo
+to exist.
+
+**One-time setup:** repo public, and Pages enabled with `gh-pages` as source.
+Packages are unsigned (`SigLevel = Optional TrustAll`).
 
 ## Working rules
 

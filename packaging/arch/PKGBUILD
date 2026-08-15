@@ -4,7 +4,7 @@ pkgver=2026.8.1
 pkgrel=1
 pkgdesc="Catalogues a directory tree into SQLite and reports what changed on later runs"
 arch=('x86_64')
-url="https://bitbucket.org/do-i/metainjester"
+url="https://github.com/do-i/metainjester"
 license=('MIT')
 # rusqlite links the system SQLite rather than bundling it, per design §3.
 depends=('sqlite' 'gcc-libs' 'glibc')

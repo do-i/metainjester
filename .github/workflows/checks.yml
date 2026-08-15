@@ -1,0 +1,39 @@
+name: Checks
+
+# The gate that scripts/release.sh requires to be green before it will cut a
+# release. There are no tests yet by project rule, so `cargo test` passes
+# trivially — it is here so the gate keeps working the day tests land, rather
+# than needing to be remembered then.
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      # rusqlite links the system SQLite rather than bundling it, per design
+      # §3, so the check environment needs it just like the package build.
+      - name: Install toolchain
+        run: pacman -Syu --noconfirm --needed rust sqlite git
+
+      - uses: actions/checkout@v7
+
+      - name: Mark workspace as a safe git directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # --locked everywhere: Cargo.lock is committed, and a release must build
+      # from exactly what is in the tree. A stale lock should fail here, loudly,
+      # rather than inside makepkg's --frozen build during a tag run.
+      - name: Build
+        run: cargo build --locked --release
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --release
