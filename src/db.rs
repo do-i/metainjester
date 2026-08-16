@@ -141,6 +141,35 @@ CREATE TABLE IF NOT EXISTS scan_errors (
 CREATE INDEX IF NOT EXISTS scan_errors_by_scan ON scan_errors(scan_id);
 ";
 
+/// Convenience views for hand-written queries and SQLiteBrowser. They hold no
+/// data, so they are dropped and rebuilt on every open rather than guarded with
+/// `IF NOT EXISTS` — that way a changed definition can never go stale in an
+/// existing database, and adding one needs no `SCHEMA_VERSION` bump and no
+/// recreation.
+///
+/// `current_files` exists because the default click in a browser is `SELECT *
+/// FROM files`, which silently includes `deleted` and `unreadable` rows. The
+/// text paths here are lossy, exactly like the `parent_path` / `name` /
+/// `extension` helper columns: `relative_path` stays the authority, and is
+/// carried through unchanged for anyone who needs the real bytes.
+pub const VIEWS: &str = "
+DROP VIEW IF EXISTS current_files;
+CREATE VIEW current_files AS
+SELECT f.file_id,
+       b.base_path,
+       b.base_path || '/' || CAST(f.relative_path AS TEXT) AS absolute_path,
+       f.relative_path,
+       f.parent_path, f.name, f.extension,
+       f.size_bytes, f.mtime_ns, f.created_ns,
+       f.mime_type, f.mime_source,
+       f.hash_algorithm, f.hash_status,
+       hex(f.content_hash) AS content_hash_hex,
+       f.metadata_from_scan_id
+FROM files f
+JOIN bases b ON b.base_id = f.base_id
+WHERE f.presence = 'present';
+";
+
 pub struct Opened {
     pub conn: Connection,
     pub path: PathBuf,
@@ -292,6 +321,7 @@ fn init(conn: &Connection) -> Result<(), AppError> {
 /// left to fail later on a missing column.
 pub fn ensure_schema(conn: &Connection, path: &Path) -> Result<(), AppError> {
     conn.execute_batch(SCHEMA).map_err(AppError::db)?;
+    conn.execute_batch(VIEWS).map_err(AppError::db)?;
     let version: Option<String> = conn
         .query_row(
             "SELECT value FROM application_metadata WHERE key = 'schema_version'",

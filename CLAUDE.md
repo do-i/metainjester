@@ -98,6 +98,11 @@ scan_errors(error_id, scan_id, relative_path, stage, error_code, message)
 `relative_path` is BINARY; the three helper columns are lossy TEXT for query
 convenience. `field_mask` bits: size=1, mtime=2, MIME=4, hash=8, presence=16.
 
+View `current_files` — `presence = 'present'` joined to `bases` for
+`absolute_path`, plus `content_hash_hex`. Views are dropped and rebuilt in
+`ensure_schema` on every open, so changing one needs no `SCHEMA_VERSION` bump and
+no recreation.
+
 ## Verified
 
 34,741 files (`/usr/include`, 341 MiB) in 7.6s; rerun 0.45s hashing nothing;
@@ -123,7 +128,7 @@ symlinks excluded by count only.
 Nothing is planned — waiting on the user's testing, then delta updates.
 
 Post-MVP in the design: `status`, `doctor`, rename detection, content sniffing,
-always-hash policy, convenience views.
+always-hash policy.
 
 ## Packaging
 

@@ -108,6 +108,20 @@ attempts. Creating the database with `auto_vacuum = INCREMENTAL` would let prune
 return space directly, but that cannot be switched on afterwards without a full
 `VACUUM`; worth considering at the next schema break.
 
+## Views
+
+`current_files` filters `presence = 'present'` and joins `bases` for an absolute
+path, because the default click in a browser is `SELECT * FROM files` — which
+silently includes `deleted` and `unreadable` rows. `content_hash` is exposed as
+hex so it compares directly against `sha256sum`; the text paths are lossy in
+exactly the way the `parent_path` / `name` / `extension` helper columns already
+are, and `relative_path` is carried through unchanged as the authority.
+
+Views hold no data, so they are **dropped and rebuilt on every open** rather than
+guarded with `IF NOT EXISTS`. A changed definition therefore cannot go stale in
+an existing database, and adding a view needs neither a `SCHEMA_VERSION` bump nor
+a recreation — the one kind of schema change that costs the user nothing.
+
 ## Open
 
 Nothing. All prior entries are settled: file-level errors shield rather than
@@ -121,9 +135,6 @@ Roughly in the order they are likely to matter.
 - **Do not add a foreign key from `scan_changes` to `files`.** `scan_changes`
   stores `relative_path` deliberately, so dead `files` rows can be pruned without
   touching history. An FK would couple the two prunes together.
-- **Convenience views** for SQLiteBrowser — a `current_files` view that filters
-  `presence = 'present'` and joins `bases` for absolute paths, so the default
-  click is correct and forgetting the filter cannot silently include deleted rows.
 - **`status` and `doctor`.** Read-only diagnostics: configured path, known bases,
   latest and resumable scans; then schema checks, `quick_check`, file modes, free
   space, stale staging. Add when a real need appears.
