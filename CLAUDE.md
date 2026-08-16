@@ -1,8 +1,8 @@
 # metainjester
 
 Rust CLI that catalogues a directory tree into SQLite and reports what changed
-on later runs. Design doc: `docs/design.md` — intent, invariants, and what is
-still open. It is version-controlled, so git history replaces the old
+on later runs. Design doc: `docs/design.md` — intent and invariants; it records
+decisions, not plans. It is version-controlled, so git history replaces the old
 dated-delta scheme; edit it in place and keep the diff small.
 
 ## State
@@ -16,6 +16,7 @@ reason is noted in `docs/design.md`.
 
 ```text
 metainjester ingest <base-path>          # scan; also the resume command
+metainjester status                      # read-only; resumable scan + policy drift
 metainjester history prune [--apply]     # bound history; preview unless --apply
 ```
 
@@ -127,8 +128,7 @@ symlinks excluded by count only.
 
 Nothing is planned — waiting on the user's testing, then delta updates.
 
-Post-MVP in the design: `status`, `doctor`, rename detection, content sniffing,
-always-hash policy.
+Content sniffing for MIME is out of scope — see Product in `docs/design.md`.
 
 ## Packaging
 
