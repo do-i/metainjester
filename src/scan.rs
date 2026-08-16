@@ -45,6 +45,8 @@ pub struct Outcome {
     pub reused_stage: u64,
     pub reused_baseline: u64,
     pub errors: usize,
+    pub unreadable: usize,
+    pub unreadable_paths: usize,
     pub discovered_bytes: u64,
     pub excluded_hidden: u64,
     pub excluded_mount: u64,
@@ -293,6 +295,8 @@ pub fn ingest(
         reused_stage: reused_stage.load(Ordering::Relaxed),
         reused_baseline: reused_baseline.load(Ordering::Relaxed),
         errors,
+        unreadable: 0,
+        unreadable_paths: 0,
         discovered_bytes: counts.discovered_bytes.load(Ordering::Relaxed),
         excluded_hidden: counts.hidden.load(Ordering::Relaxed),
         excluded_mount: counts.mount.load(Ordering::Relaxed),
@@ -303,13 +307,19 @@ pub fn ingest(
         duration_ms: 0,
     };
 
-    // 7. Only a fully traversed, uncancelled, error-free scan may promote.
-    // Anything else keeps its staging and leaves the baseline exactly as it was.
-    if stopped || errors > 0 {
+    // 7. File-level errors no longer block: a vanished file is simply gone, and
+    // an unreadable directory is shielded at promotion rather than allowed to
+    // record its contents as deleted. A cancelled scan still keeps its staging
+    // and leaves the baseline exactly as it was, and so does an unreadable base
+    // — that one failure puts every path in the baseline in doubt at once, and
+    // no prefix can shield them because the base prefixes everything.
+    outcome.unreadable_paths = unreadable_path_count(conn, scan_id)?;
+    let base_unreadable = base_unreadable(conn, scan_id)?;
+    if stopped || base_unreadable {
         let (status, code) = if stopped {
             ("cancelled", "cancelled")
         } else {
-            ("partial", "scan_errors")
+            ("partial", "base_unreadable")
         };
         outcome.status = status;
         outcome.duration_ms = started.elapsed().as_millis() as u64;
@@ -322,7 +332,11 @@ pub fn ingest(
                 now_ns(),
                 outcome.duration_ms as i64,
                 code,
-                format!("{errors} error(s); baseline left unchanged"),
+                if base_unreadable {
+                    "base directory is unreadable; baseline left unchanged".to_string()
+                } else {
+                    format!("{errors} error(s); baseline left unchanged")
+                },
                 free_bytes(db_path).unwrap_or(0) as i64,
                 scan_id
             ],
@@ -731,6 +745,66 @@ fn truncate(s: &str) -> String {
     format!("{}…", &s[..end])
 }
 
+/// How many distinct paths the walk could not read. The summary reports only
+/// this count; `scan_errors` holds which ones, for the query the user runs.
+fn unreadable_path_count(conn: &Connection, scan_id: i64) -> Result<usize, AppError> {
+    let codes = walk::UNREADABLE_CODES
+        .iter()
+        .map(|c| format!("'{c}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(DISTINCT relative_path) FROM scan_errors
+             WHERE scan_id = ?1 AND error_code IN ({codes})"
+        ),
+        params![scan_id],
+        |r| r.get::<_, i64>(0).map(|n| n as usize),
+    )
+    .map_err(AppError::db)
+}
+
+/// True when the walk could not read the base itself, which arrives as an error
+/// on the empty relative path.
+fn base_unreadable(conn: &Connection, scan_id: i64) -> Result<bool, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT error_code FROM scan_errors
+             WHERE scan_id = ?1 AND relative_path IS NOT NULL AND length(relative_path) = 0",
+        )
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(params![scan_id]).map_err(AppError::db)?;
+    while let Some(row) = rows.next().map_err(AppError::db)? {
+        if walk::unreadable(&row.get::<_, String>(0).map_err(AppError::db)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// SQL predicate: `alias`'s path is an unreadable path from this scan, or lies
+/// under one. Comparison is byte-wise on purpose — `relative_path` is a BLOB
+/// holding the exact filesystem identity, and SQLite's `||` would coerce it to
+/// text and mangle any path that is not valid UTF-8. Assumes `?1` is `scan_id`.
+fn shielded(alias: &str) -> String {
+    let codes = walk::UNREADABLE_CODES
+        .iter()
+        .map(|c| format!("'{c}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "EXISTS (SELECT 1 FROM scan_errors e
+                 WHERE e.scan_id = ?1 AND e.relative_path IS NOT NULL
+                   AND length(e.relative_path) > 0
+                   AND e.error_code IN ({codes})
+                   AND ({alias}.relative_path = e.relative_path
+                        OR (substr({alias}.relative_path, 1, length(e.relative_path))
+                              = e.relative_path
+                            AND substr({alias}.relative_path,
+                                       length(e.relative_path) + 1, 1) = x'2f')))"
+    )
+}
+
 /// Promotion (design §7 step 8), in one transaction. Change rows are written
 /// first because they read the outgoing `files` state.
 fn promote(
@@ -773,27 +847,34 @@ fn promote(
                     f.mime_type, s.mime_type, f.content_hash, s.content_hash
              FROM scan_stage_entries s
              JOIN files f ON f.base_id = s.base_id AND f.relative_path = s.relative_path
-             WHERE s.scan_id = ?1 AND s.complete = 1 AND f.presence = 'present'
+             WHERE s.scan_id = ?1 AND s.complete = 1
+               AND f.presence IN ('present', 'unreadable')
                AND (f.size_bytes <> s.size_bytes OR f.mtime_ns <> s.mtime_ns
                     OR f.mime_type IS NOT s.mime_type OR f.content_hash <> s.content_hash)",
             params![scan_id, F_SIZE, F_MTIME, F_MIME, F_HASH],
         )
         .map_err(AppError::db)?;
 
+    // A path the walk could not read is not evidence of deletion, so it earns
+    // neither a change row here nor a `deleted` presence below.
     let deleted = tx
         .execute(
-            "INSERT INTO scan_changes
-                 (scan_id, base_id, relative_path, change_kind, field_mask,
-                  old_size_bytes, new_size_bytes, old_mtime_ns, new_mtime_ns,
-                  old_mime_type, new_mime_type, old_content_hash, new_content_hash)
-             SELECT ?1, f.base_id, f.relative_path, 'deleted', ?3,
-                    f.size_bytes, NULL, f.mtime_ns, NULL, f.mime_type, NULL,
-                    f.content_hash, NULL
-             FROM files f
-             WHERE f.base_id = ?2 AND f.presence = 'present'
-               AND NOT EXISTS (SELECT 1 FROM scan_stage_entries s
-                               WHERE s.scan_id = ?1 AND s.relative_path = f.relative_path
-                                 AND s.complete = 1)",
+            &format!(
+                "INSERT INTO scan_changes
+                     (scan_id, base_id, relative_path, change_kind, field_mask,
+                      old_size_bytes, new_size_bytes, old_mtime_ns, new_mtime_ns,
+                      old_mime_type, new_mime_type, old_content_hash, new_content_hash)
+                 SELECT ?1, f.base_id, f.relative_path, 'deleted', ?3,
+                        f.size_bytes, NULL, f.mtime_ns, NULL, f.mime_type, NULL,
+                        f.content_hash, NULL
+                 FROM files f
+                 WHERE f.base_id = ?2 AND f.presence IN ('present', 'unreadable')
+                   AND NOT EXISTS (SELECT 1 FROM scan_stage_entries s
+                                   WHERE s.scan_id = ?1 AND s.relative_path = f.relative_path
+                                     AND s.complete = 1)
+                   AND NOT {}",
+                shielded("f")
+            ),
             params![scan_id, base_id, F_PRESENCE],
         )
         .map_err(AppError::db)?;
@@ -812,7 +893,7 @@ fn promote(
          FROM scan_stage_entries s
          LEFT JOIN files f ON f.base_id = s.base_id AND f.relative_path = s.relative_path
          WHERE s.scan_id = ?1 AND s.complete = 1
-           AND (f.file_id IS NULL OR f.presence = 'deleted'
+           AND (f.file_id IS NULL OR f.presence IN ('deleted', 'unreadable')
                 OR f.size_bytes <> s.size_bytes OR f.mtime_ns <> s.mtime_ns
                 OR f.mime_type IS NOT s.mime_type OR f.content_hash <> s.content_hash)
          ON CONFLICT(base_id, relative_path) DO UPDATE SET
@@ -833,12 +914,36 @@ fn promote(
     )
     .map_err(AppError::db)?;
 
+    // Unseen because unreadable, not because gone. These rows stay queryable as
+    // their own presence so the user can fix the permission and rerun, or decide
+    // the paths really are finished with. A later scan that can read the path
+    // restores them silently: the upsert above sets `present` again, and no
+    // change row is written unless the file itself actually changed.
+    let unreadable = tx
+        .execute(
+            &format!(
+                "UPDATE files SET presence = 'unreadable'
+                 WHERE base_id = ?2 AND presence IN ('present', 'unreadable')
+                   AND NOT EXISTS (SELECT 1 FROM scan_stage_entries s
+                                   WHERE s.scan_id = ?1 AND s.relative_path = files.relative_path
+                                     AND s.complete = 1)
+                   AND {}",
+                shielded("files")
+            ),
+            params![scan_id, base_id],
+        )
+        .map_err(AppError::db)?;
+
     tx.execute(
-        "UPDATE files SET presence = 'deleted', deleted_in_scan_id = ?1
-         WHERE base_id = ?2 AND presence = 'present'
-           AND NOT EXISTS (SELECT 1 FROM scan_stage_entries s
-                           WHERE s.scan_id = ?1 AND s.relative_path = files.relative_path
-                             AND s.complete = 1)",
+        &format!(
+            "UPDATE files SET presence = 'deleted', deleted_in_scan_id = ?1
+             WHERE base_id = ?2 AND presence IN ('present', 'unreadable')
+               AND NOT EXISTS (SELECT 1 FROM scan_stage_entries s
+                               WHERE s.scan_id = ?1 AND s.relative_path = files.relative_path
+                                 AND s.complete = 1)
+               AND NOT {}",
+            shielded("files")
+        ),
         params![scan_id, base_id],
     )
     .map_err(AppError::db)?;
@@ -855,7 +960,7 @@ fn promote(
     tx.execute(
         "UPDATE scans SET status = 'complete', finished_at_ns = ?1,
              added_count = ?2, updated_count = ?3, deleted_count = ?4,
-             unchanged_count = ?5, error_count = 0, present_count = ?6
+             unchanged_count = ?5, error_count = ?8, present_count = ?6
          WHERE scan_id = ?7",
         params![
             now_ns(),
@@ -864,7 +969,8 @@ fn promote(
             deleted as i64,
             unchanged as i64,
             present,
-            scan_id
+            scan_id,
+            outcome.errors as i64
         ],
     )
     .map_err(AppError::db)?;
@@ -885,6 +991,7 @@ fn promote(
     outcome.deleted = deleted;
     outcome.unchanged = unchanged;
     outcome.present = present as usize;
+    outcome.unreadable = unreadable;
     Ok(())
 }
 

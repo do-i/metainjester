@@ -21,6 +21,15 @@ Each of these has a reason that is easy to forget and expensive to rediscover.
 - **`files` is the last successfully completed scan.** A cancelled, failed, or
   partial scan must never leave a mixed view, create deletion records, or replace
   the baseline. Deletion is only ever established by a complete scan.
+- **Absence is only evidence of deletion when the path could be read.** A file
+  that vanished mid-scan is simply gone and must not hold the scan hostage. A
+  directory that could not be read leaves its contents unknown, so its baseline
+  rows become `presence = 'unreadable'` rather than `deleted`, and get no change
+  row in either direction — fixing the permission and rerunning must land exactly
+  where a readable first scan would have, with unchanged files showing no change.
+  Only the unreadable base itself still refuses to promote: it prefixes every
+  path, so nothing can be shielded and the whole baseline is in doubt at once.
+  Which paths failed lives in `scan_errors`; the summary reports only a count.
 - **Inclusion policy must match the baseline or the rescan refuses.** If a prior
   scan included `.cache` and the current config skips hidden files, every hidden
   path would look deleted. This is the whole reason the three policy fields are
@@ -63,11 +72,8 @@ is published.
 
 ## Open
 
-Two implementation choices that may be wrong:
+One implementation choice that may be wrong:
 
-- **Any file-level error blocks promotion.** A vanished temporary file is
-  currently as fatal as a permission failure. Likely too strict on live
-  directories — needs a distinction between trust-breaking and transient errors.
 - **Free-space preflight for a new base uses only the configured minimum.**
   `initial_average_file_kib` is parsed and reported but does not feed the gate,
   because expected file count does not exist before the first walk. A rescan

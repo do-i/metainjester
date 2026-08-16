@@ -187,6 +187,18 @@ fn report(db_path: &std::path::Path, base: &std::path::Path, config: &Config, o:
             o.added, o.updated, o.deleted, o.unchanged
         );
         println!("present {}", o.present);
+        // Deliberately a count, not a list: a permission slip can cover a large
+        // subtree, and the paths are already in the database to be queried.
+        if o.unreadable_paths > 0 {
+            println!(
+                "unreadable {} path(s) could not be read; {} file row(s) held as 'unreadable'",
+                o.unreadable_paths, o.unreadable
+            );
+            println!(
+                "  see: SELECT relative_path, error_code, message FROM scan_errors WHERE scan_id = {};",
+                o.scan_id
+            );
+        }
     } else {
         println!("baseline unchanged; rerun `ingest` on the same path to resume");
         if o.errors > 0 {

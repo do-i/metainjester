@@ -42,10 +42,19 @@ baseline, then hash. An unchanged rerun hashes nothing and rewrites no rows.
 
 ### Lifecycle
 
-Only a fully traversed, uncancelled, error-free scan promotes. Promotion is one
-transaction: write `scan_changes`, upsert `files`, mark absences `deleted`, move
+Only a fully traversed, uncancelled scan promotes. Promotion is one transaction:
+write `scan_changes`, upsert `files`, mark absences under an unreadable path
+`unreadable` and every other absence `deleted`, move
 `bases.last_complete_scan_id`, drain staging. Anything else keeps its staging and
 leaves the baseline untouched, and the next `ingest` on that base resumes it.
+
+File-level errors do not block promotion. `permission_denied`, `io_error`, and
+`invalid_data` (`walk::UNREADABLE_CODES`) shield the failing path and everything
+beneath it from deletion — the byte-wise prefix test in `scan::shielded`, never
+string concatenation, since `relative_path` is a BLOB. An unreadable base is the
+exception and yields `partial` / `base_unreadable`: it prefixes every path, so
+nothing can be shielded. `unreadable` rows return to `present` on a scan that can
+read them again, with no change row unless the file itself changed.
 
 Exit codes: `0` ok, `1` error/partial, `2` usage, `3` config, `4` busy,
 `5` no space, `6` policy mismatch, `130` cancelled.
@@ -65,6 +74,7 @@ files(file_id, base_id, relative_path, parent_path, name, extension, presence,
       size_bytes, mtime_ns, created_ns, mime_type, mime_source,
       hash_algorithm, content_hash, hash_status,
       metadata_from_scan_id, deleted_in_scan_id)
+  presence: present | deleted | unreadable
 scan_stage_entries(...)  UNIQUE(scan_id, relative_path)
 scan_changes(change_id, scan_id, base_id, relative_path, change_kind,
              field_mask, old_/new_ size_bytes, mtime_ns, mime_type, content_hash)
@@ -82,8 +92,11 @@ convenience. `field_mask` bits: size=1, mtime=2, MIME=4, hash=8, presence=16.
 
 Also: SIGKILL and SIGINT mid-scan leave the baseline untouched and resume
 correctly (exit 130 on SIGINT); a file deleted between attempts never reaches
-`files`; unreadable file and change-during-hash both yield `partial` with the
-baseline intact, then complete on retry; policy change is refused with
+`files`; a locked directory promotes with its rows held `unreadable` and no
+deletion recorded, returns to `present` with zero change rows once the permission
+is restored, and records `deleted` if the file really went away meanwhile, while
+an unreadable base still yields `partial` with the baseline intact; policy change
+is refused with
 `policy_mismatch`; foreign and other-application databases in the working
 directory are refused; a stale writer lock from a dead pid is reclaimed; mount
 boundaries skipped and crossed per policy (verified under `unshare -rm`);
