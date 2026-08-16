@@ -4,6 +4,7 @@
 
 mod config;
 mod db;
+mod history;
 mod scan;
 mod walk;
 
@@ -74,10 +75,11 @@ impl AppError {
             code: EXIT_POLICY,
         }
     }
-    pub fn no_space(free: u64, required: u64, source: &str) -> AppError {
+    pub fn no_space(free: u64, required: u64) -> AppError {
         AppError {
             message: format!(
-                "insufficient free space: {} available, {} required ({source})",
+                "insufficient free space: {} available, {} must stay free \
+                 (storage.minimum_free_space_mib)",
                 human(free),
                 human(required)
             ),
@@ -97,16 +99,18 @@ fn main() {
     std::process::exit(code);
 }
 
+const USAGE: &str = "usage: metainjester ingest <base-path>\n       \
+                     metainjester history prune [--apply]\n  \
+                     policy and storage settings come from the configuration file, not flags";
+
 fn run() -> Result<i32, AppError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let raw_base = match args.as_slice() {
         [cmd, path] if cmd == "ingest" => path.clone(),
-        _ => {
-            return Err(AppError::usage(
-                "usage: metainjester ingest <base-path>\n  \
-                 policy and storage settings come from the configuration file, not flags",
-            ))
-        }
+        // Preview is the default: `prune` alone never deletes anything.
+        [a, b] if a == "history" && b == "prune" => return prune(false),
+        [a, b, f] if a == "history" && b == "prune" && f == "--apply" => return prune(true),
+        _ => return Err(AppError::usage(USAGE)),
     };
 
     let config = Config::load()?;
@@ -139,8 +143,76 @@ fn run() -> Result<i32, AppError> {
     Ok(match outcome.status {
         "complete" => EXIT_OK,
         "cancelled" => EXIT_CANCELLED,
+        // Stopping at the floor is the same condition as refusing at the floor,
+        // so a script watching for "out of space" sees one code either way.
+        _ if outcome.low_space => EXIT_NO_SPACE,
         _ => EXIT_ERROR,
     })
+}
+
+/// `history prune`. Walks no tree and touches no file — it only bounds what the
+/// database already holds, so it is the cheap way to act on a lowered
+/// `keep_scans` without waiting for the next scan.
+fn prune(apply: bool) -> Result<i32, AppError> {
+    let config = Config::load()?;
+    let opened = db::discover(&config)?;
+    db::ensure_schema(&opened.conn, &opened.path)?;
+
+    println!("db      {}", opened.path.display());
+    if config.keep_scans == 0 {
+        println!("policy  history.keep_scans = 0 — history is kept forever, nothing to prune");
+        println!("  set [history] keep_scans = N in the configuration file to bound it");
+        return Ok(EXIT_OK);
+    }
+    println!("policy  history.keep_scans = {}", config.keep_scans);
+
+    // The lock is only taken to delete. A preview is read-only, so it stays
+    // available while a scan is running.
+    if apply {
+        db::acquire_writer_lock(&opened.conn)?;
+    }
+    let result = history::prune_all(&opened.conn, &config, apply);
+    if apply {
+        db::release_writer_lock(&opened.conn);
+    }
+    let bases = result?;
+
+    let mut total = 0u64;
+    for b in &bases {
+        println!("base    {}", b.base_path);
+        match b.cutoff {
+            None => println!(
+                "  fewer than {} complete scans — nothing has aged out yet",
+                config.keep_scans
+            ),
+            Some(cutoff) => {
+                println!(
+                    "  keeping scans >= {cutoff}; {} change row(s), {} dead file row(s){}",
+                    b.changes,
+                    b.files,
+                    if apply { " removed" } else { " prunable" }
+                );
+                total += b.total();
+            }
+        }
+    }
+    if bases.is_empty() {
+        println!("no bases in this database");
+    }
+
+    if total == 0 {
+        println!("nothing to do");
+    } else if apply {
+        println!(
+            "removed {total} row(s). The file will not shrink — freed pages are reused, so it \
+             stops growing.\n  to reclaim the bytes: sqlite3 {} \"VACUUM INTO 'new.sqlite3'\" \
+             then swap it in",
+            opened.path.display()
+        );
+    } else {
+        println!("preview only — rerun with --apply to delete");
+    }
+    Ok(EXIT_OK)
 }
 
 fn report(db_path: &std::path::Path, base: &std::path::Path, config: &Config, o: &scan::Outcome) {
@@ -174,7 +246,7 @@ fn report(db_path: &std::path::Path, base: &std::path::Path, config: &Config, o:
     }
     println!("errors  {}", o.errors);
     println!(
-        "free    {} available, {} required — {}",
+        "free    {} at start, {} must stay free — {}",
         human(o.free_before),
         human(o.required_free),
         o.estimate_source
@@ -187,6 +259,12 @@ fn report(db_path: &std::path::Path, base: &std::path::Path, config: &Config, o:
             o.added, o.updated, o.deleted, o.unchanged
         );
         println!("present {}", o.present);
+        if o.pruned_changes + o.pruned_files > 0 {
+            println!(
+                "pruned  {} change row(s), {} dead file row(s) (history.keep_scans = {})",
+                o.pruned_changes, o.pruned_files, config.keep_scans
+            );
+        }
         // Deliberately a count, not a list: a permission slip can cover a large
         // subtree, and the paths are already in the database to be queried.
         if o.unreadable_paths > 0 {
@@ -200,6 +278,12 @@ fn report(db_path: &std::path::Path, base: &std::path::Path, config: &Config, o:
             );
         }
     } else {
+        if o.low_space {
+            println!(
+                "stopped: reached the {} free-space floor — free some space, then rerun",
+                human(o.required_free)
+            );
+        }
         println!("baseline unchanged; rerun `ingest` on the same path to resume");
         if o.errors > 0 {
             println!("  see: SELECT stage, error_code, message FROM scan_errors WHERE scan_id = {};", o.scan_id);

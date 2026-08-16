@@ -15,11 +15,11 @@ discovery, inclusion policy, MIME, worker pipeline, free-space preflight,
 reason is noted in `docs/design.md`.
 
 ```text
-metainjester ingest <base-path>      # the entire command surface
+metainjester ingest <base-path>          # scan; also the resume command
+metainjester history prune [--apply]     # bound history; preview unless --apply
 ```
 
-`ingest` is also the resume command. Policy and storage come from configuration,
-never from flags.
+Policy and storage come from configuration, never from flags.
 
 ### Modules
 
@@ -29,6 +29,7 @@ never from flags.
   `foreign_keys`), and the `writer_lock` single-writer guard.
 - `walk.rs` — traversal, the three inclusion policies, MIME, path helpers.
 - `scan.rs` — the §7 lifecycle: preflight, stage, validate, promote.
+- `history.rs` — retention: the cutoff, and the two batched prunes.
 
 ### Pipeline
 
@@ -55,6 +56,19 @@ string concatenation, since `relative_path` is a BLOB. An unreadable base is the
 exception and yields `partial` / `base_unreadable`: it prefixes every path, so
 nothing can be shielded. `unreadable` rows return to `present` on a scan that can
 read them again, with no change row unless the file itself changed.
+
+Free space is a floor, not an estimate: `storage.minimum_free_space_mib`
+(default 500) is checked in preflight and again after every committed batch in
+`writer`. Crossing it sets `low_space`, which cancels the pipeline, yields
+`partial` / `low_space`, and exits 5 like the up-front refusal. Nothing predicts
+a scan's size — there is no expected-file-count math and no per-file reservation.
+
+`history.keep_scans` (default 0 = keep everything) bounds `scan_changes` and the
+dead tail of `deleted` `files` rows to the newest N **complete** scans per base.
+It runs after promotion, outside that transaction, and a failure is reported not
+fatal. `unreadable` rows are never pruned; `scans` rows are always kept, which is
+what keeps it FK-safe. Deletes are batched at `writer_batch_rows`. Pruning frees
+pages for reuse but does not shrink the file — that needs `VACUUM INTO`.
 
 Exit codes: `0` ok, `1` error/partial, `2` usage, `3` config, `4` busy,
 `5` no space, `6` policy mismatch, `130` cancelled.
@@ -95,9 +109,10 @@ correctly (exit 130 on SIGINT); a file deleted between attempts never reaches
 `files`; a locked directory promotes with its rows held `unreadable` and no
 deletion recorded, returns to `present` with zero change rows once the permission
 is restored, and records `deleted` if the file really went away meanwhile, while
-an unreadable base still yields `partial` with the baseline intact; policy change
-is refused with
-`policy_mismatch`; foreign and other-application databases in the working
+an unreadable base still yields `partial` with the baseline intact; the
+free-space floor refuses up front and also stops mid-scan (both exit 5), with the
+interrupted attempt resuming off its staged rows without rehashing them; policy
+change is refused with `policy_mismatch`; foreign and other-application databases in the working
 directory are refused; a stale writer lock from a dead pid is reclaimed; mount
 boundaries skipped and crossed per policy (verified under `unshare -rm`);
 symlink loops terminate; rename yields `deleted` + `added`; hidden entries and
@@ -107,8 +122,8 @@ symlinks excluded by count only.
 
 Nothing is planned — waiting on the user's testing, then delta updates.
 
-Post-MVP in the design: `history prune`, `status`, `doctor`, rename detection,
-content sniffing, always-hash policy.
+Post-MVP in the design: `status`, `doctor`, rename detection, content sniffing,
+always-hash policy, convenience views.
 
 ## Packaging
 

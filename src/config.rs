@@ -39,6 +39,8 @@ struct RawFile {
     scan: Option<RawScan>,
     #[serde(default)]
     storage: Option<RawStorage>,
+    #[serde(default)]
+    history: Option<RawHistory>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,14 +53,19 @@ struct RawScan {
     skip_hidden: Option<bool>,
     skip_mount_boundaries: Option<bool>,
     follow_symlinks: Option<bool>,
-    initial_average_file_kib: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawStorage {
     database_path: Option<String>,
-    minimum_free_space_gib: Option<u64>,
+    minimum_free_space_mib: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHistory {
+    keep_scans: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,9 +78,9 @@ pub struct Config {
     pub skip_hidden: bool,
     pub skip_mount_boundaries: bool,
     pub follow_symlinks: bool,
-    pub initial_average_file_kib: u64,
     pub database_path: PathBuf,
-    pub minimum_free_space_gib: u64,
+    pub minimum_free_space_mib: u64,
+    pub keep_scans: u64,
 }
 
 impl Config {
@@ -84,6 +91,7 @@ impl Config {
         let mut merged = RawFile {
             scan: None,
             storage: None,
+            history: None,
         };
         let mut files = vec![PathBuf::from(SYSTEM_CONFIG)];
         if let Some(home) = home_dir() {
@@ -97,7 +105,7 @@ impl Config {
                 AppError::config(format!("cannot read {}: {e}", path.display()))
             })?;
             let raw: RawFile = toml::from_str(&text).map_err(|e| {
-                AppError::config(format!("{}: {}", path.display(), first_line(&e.to_string())))
+                AppError::config(format!("{}: {}", path.display(), toml_reason(&e.to_string())))
             })?;
             merge(&mut merged, raw);
         }
@@ -113,12 +121,12 @@ impl Config {
             skip_hidden: None,
             skip_mount_boundaries: None,
             follow_symlinks: None,
-            initial_average_file_kib: None,
         });
         let storage = raw.storage.unwrap_or(RawStorage {
             database_path: None,
-            minimum_free_space_gib: None,
+            minimum_free_space_mib: None,
         });
+        let history = raw.history.unwrap_or(RawHistory { keep_scans: None });
 
         // auto = min(4, max(1, logical_cpus / 2)); more workers usually buys disk
         // contention rather than throughput.
@@ -145,13 +153,6 @@ impl Config {
             )));
         }
 
-        let initial_average_file_kib = scan.initial_average_file_kib.unwrap_or(200);
-        if initial_average_file_kib == 0 {
-            return Err(AppError::config(
-                "scan.initial_average_file_kib: must be greater than 0",
-            ));
-        }
-
         let raw_db = storage
             .database_path
             .unwrap_or_else(|| "~/.local/share/metainjester/metainjester.sqlite3".to_string());
@@ -168,9 +169,11 @@ impl Config {
             skip_hidden: scan.skip_hidden.unwrap_or(true),
             skip_mount_boundaries: scan.skip_mount_boundaries.unwrap_or(true),
             follow_symlinks: scan.follow_symlinks.unwrap_or(false),
-            initial_average_file_kib,
             database_path,
-            minimum_free_space_gib: storage.minimum_free_space_gib.unwrap_or(2),
+            minimum_free_space_mib: storage.minimum_free_space_mib.unwrap_or(500),
+            // 0 keeps everything. Deleting a user's history because they
+            // upgraded is not a default worth choosing.
+            keep_scans: history.keep_scans.unwrap_or(0),
         })
     }
 }
@@ -201,9 +204,6 @@ fn merge(into: &mut RawFile, from: RawFile) {
                 if s.follow_symlinks.is_some() {
                     t.follow_symlinks = s.follow_symlinks;
                 }
-                if s.initial_average_file_kib.is_some() {
-                    t.initial_average_file_kib = s.initial_average_file_kib;
-                }
             }
         }
     }
@@ -214,16 +214,34 @@ fn merge(into: &mut RawFile, from: RawFile) {
                 if s.database_path.is_some() {
                     t.database_path = s.database_path;
                 }
-                if s.minimum_free_space_gib.is_some() {
-                    t.minimum_free_space_gib = s.minimum_free_space_gib;
+                if s.minimum_free_space_mib.is_some() {
+                    t.minimum_free_space_mib = s.minimum_free_space_mib;
+                }
+            }
+        }
+    }
+    if let Some(s) = from.history {
+        match into.history.as_mut() {
+            None => into.history = Some(s),
+            Some(t) => {
+                if s.keep_scans.is_some() {
+                    t.keep_scans = s.keep_scans;
                 }
             }
         }
     }
 }
 
-fn first_line(s: &str) -> String {
-    s.lines().next().unwrap_or(s).to_string()
+/// A `toml` error prints the location first and the actual reason last, with
+/// caret art in between. Keeping only the first line loses the reason — which is
+/// the half that says `unknown field ...` after a config key is renamed.
+fn toml_reason(s: &str) -> String {
+    let mut lines = s.lines().filter(|l| !l.trim().is_empty());
+    let first = lines.next().unwrap_or(s).trim().to_string();
+    match lines.rfind(|l| !l.trim_start().starts_with(['|', '^'])) {
+        Some(last) if last.trim() != first => format!("{first}: {}", last.trim()),
+        _ => first,
+    }
 }
 
 pub fn home_dir() -> Option<PathBuf> {

@@ -16,6 +16,24 @@ command = 'read -r -p "Base path: " p && cargo run -- ingest "$p"'
 group = "Run"
 
 [[items]]
+id = "prune"
+label = "Just prune"
+key = "p"
+command = ["cargo", "run", "--", "history", "prune", "--apply"]
+group = "Maintenance"
+tags = ["prune", "history", "retention", "keep_scans", "grow", "size"]
+description = "Drop scan history older than history.keep_scans, without walking the tree. Run this after lowering keep_scans. Frees pages for reuse so the database stops growing, but does not shrink the file - use Shrink DB for that"
+
+[[items]]
+id = "shrink"
+label = "Shrink DB"
+key = "v"
+command = '''read -r -p "Database [metainjester.sqlite3]: " d; d=${d:-metainjester.sqlite3}; sqlite3 "$d" "VACUUM INTO '$d.new'" && mv -f "$d.new" "$d" && rm -f "$d-wal" "$d-shm" && echo "shrunk $d - reopen SQLiteBrowser, the old inode is gone"'''
+group = "Maintenance"
+tags = ["vacuum", "shrink", "compact", "reclaim", "disk", "space"]
+description = "Rewrite the database into a compact copy and swap it in, returning freed bytes to the filesystem. Prune first, or there is nothing to reclaim. Nothing else may be writing at the time"
+
+[[items]]
 id = "test"
 label = "Run tests"
 key = "t"

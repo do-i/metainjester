@@ -50,6 +50,13 @@ Each of these has a reason that is easy to forget and expensive to rediscover.
   or auxiliary index. Any future feature needing a second durable file must be
   redesigned. To copy a live database use
   `sqlite3 <db> "VACUUM INTO '<dest>'"`, never `cp`.
+- **Free space is a floor to stay above, never a size to predict.** Estimating a
+  scan's appetite needs a file count that does not exist before the first walk,
+  and the old 4 KiB-per-file guess was six times the measured row cost. So
+  `storage.minimum_free_space_mib` is checked before the scan and again after
+  every committed batch; crossing it stops the scan with `low_space`, keeps the
+  staging, and exits 5 exactly as the up-front refusal does. This is a floor, not
+  a reservation — it stops this program filling the disk, not other programs.
 - **Durability is not negotiable.** Never `journal_mode=OFF|MEMORY` or
   `synchronous=OFF`.
 - **No policy flags on the command line.** `ingest <base-path>` takes a path and
@@ -63,33 +70,54 @@ container if it needs protection.
 
 ## Capacity
 
-Planning range is 300k files (lower bound) to 5M (upper). The preflight gate
-reserves a conservative 4 KiB per expected file.
+Planning range is 300k files (lower bound) to 5M (upper). Measured on the real
+implementation: **~667 bytes per file row**, so the upper bound is roughly 3.3 GB
+of database. Nothing in the code reserves against that figure — see the
+free-space invariant — and it exists only to size a machine before buying one.
 
-Measured on the real implementation: **~667 bytes per file row**. The 4 KiB
-constant predates that and should be recalibrated before any system requirement
-is published.
+## History retention
+
+`scan_changes` grows with change *events* and was the only unbounded table; a
+directory rename high in the tree is the worst case. `files` deleted rows grow
+with *distinct paths ever seen* and are self-limiting, but leave a permanently
+dead tail after such a rename. `history.keep_scans` bounds both to the newest N
+**complete** scans per base — incomplete scans do not count toward the window, so
+a run of failures cannot age out real history.
+
+Two prunes share one cutoff: change rows strictly before it, and `files` rows
+that are `deleted` before it. `presence = 'unreadable'` is live state, never
+absence, and is never pruned. `scans`, `scan_errors`, and `scan_stage_entries`
+are kept; keeping `scans` is what makes this FK-safe, since an unchanged file's
+`metadata_from_scan_id` still points at whatever ancient scan supplied it.
+
+It runs after promotion and **outside its transaction** — promotion is the one
+atomic step that moves the baseline, and folding a large delete into it would
+stretch the window where a crash discards the scan. A prune failure is reported
+and swallowed rather than undoing a scan that already succeeded. Deletes are
+batched at `writer_batch_rows` per statement, because one giant transaction
+builds a WAL the size of the thing being shrunk.
+
+Default is 0 — keep everything. Deleting a user's history because they upgraded
+is not a default worth choosing. Measured cost is ~180 bytes per change row
+against ~667 per file row, so at 1% churn each retained scan costs roughly 0.4%
+of the baseline; the window only matters after a big rename.
+
+Deleting rows does not shrink the file — freed pages are reused, so it stops
+growing. Reclaiming bytes needs `VACUUM INTO`, which `prune` prints rather than
+attempts. Creating the database with `auto_vacuum = INCREMENTAL` would let prune
+return space directly, but that cannot be switched on afterwards without a full
+`VACUUM`; worth considering at the next schema break.
 
 ## Open
 
-One implementation choice that may be wrong:
-
-- **Free-space preflight for a new base uses only the configured minimum.**
-  `initial_average_file_kib` is parsed and reported but does not feed the gate,
-  because expected file count does not exist before the first walk. A rescan
-  correctly uses its prior present-file count × 4 KiB.
+Nothing. All prior entries are settled: file-level errors shield rather than
+block, the free-space gate is a floor rather than a prediction, and history is
+bounded.
 
 ## Future
 
 Roughly in the order they are likely to matter.
 
-- **History retention.** `scan_changes` grows with change *events* and is
-  unbounded; a directory rename high in the tree is the worst case. `files`
-  deleted rows grow with *distinct paths ever seen* and are self-limiting, but
-  leave a permanently dead tail after such a rename. Two prunes, preview-first,
-  window counted per base over completed scans only, run after promotion in a
-  separate transaction, keeping `scans` rows (they feed ETA estimates).
-  Deleting rows does not shrink the file — that needs `VACUUM INTO`.
 - **Do not add a foreign key from `scan_changes` to `files`.** `scan_changes`
   stores `relative_path` deliberately, so dead `files` rows can be pruned without
   touching history. An FK would couple the two prunes together.

@@ -15,6 +15,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::config::Config;
 use crate::db;
+use crate::history;
 use crate::walk::{self, Exclusions, WalkMsg, Walker};
 use crate::{now_ns, AppError};
 
@@ -26,8 +27,6 @@ const F_HASH: i64 = 8;
 const F_PRESENCE: i64 = 16;
 const F_ADDED: i64 = F_SIZE | F_MTIME | F_MIME | F_HASH | F_PRESENCE;
 
-/// Conservative free-space gate from design §10: 4 KiB per expected file.
-const BYTES_PER_EXPECTED_FILE: u64 = 4096;
 const HASH_BUF: usize = 1024 * 1024;
 
 pub struct Outcome {
@@ -45,6 +44,9 @@ pub struct Outcome {
     pub reused_stage: u64,
     pub reused_baseline: u64,
     pub errors: usize,
+    pub low_space: bool,
+    pub pruned_changes: u64,
+    pub pruned_files: u64,
     pub unreadable: usize,
     pub unreadable_paths: usize,
     pub discovered_bytes: u64,
@@ -146,10 +148,14 @@ pub fn ingest(
             |r| r.get::<_, i64>(0).map(|n| n as u64),
         )
         .map_err(AppError::db)?;
-    let (required_free, estimate_source) = required_free_bytes(config, prior_files);
+    let required_free = free_space_floor(config);
+    let estimate_source = format!(
+        "storage.minimum_free_space_mib = {}, rechecked every batch",
+        config.minimum_free_space_mib
+    );
     let free_before = free_bytes(db_path)?;
     if free_before < required_free {
-        return Err(AppError::no_space(free_before, required_free, &estimate_source));
+        return Err(AppError::no_space(free_before, required_free));
     }
 
     // 4. Resume a non-terminal scan, or start a new one. A scan left `running`
@@ -220,6 +226,7 @@ pub fn ingest(
     )
     .map_err(AppError::db)?;
 
+    let low_space = Arc::new(AtomicBool::new(false));
     let counts = Arc::new(Exclusions::default());
     let hashed = Arc::new(AtomicU64::new(0));
     let hashed_bytes = Arc::new(AtomicU64::new(0));
@@ -236,6 +243,7 @@ pub fn ingest(
         scan_id,
         prior_files,
         cancelled,
+        &low_space,
         &counts,
         &hashed,
         &hashed_bytes,
@@ -295,6 +303,9 @@ pub fn ingest(
         reused_stage: reused_stage.load(Ordering::Relaxed),
         reused_baseline: reused_baseline.load(Ordering::Relaxed),
         errors,
+        low_space: false,
+        pruned_changes: 0,
+        pruned_files: 0,
         unreadable: 0,
         unreadable_paths: 0,
         discovered_bytes: counts.discovered_bytes.load(Ordering::Relaxed),
@@ -315,8 +326,11 @@ pub fn ingest(
     // no prefix can shield them because the base prefixes everything.
     outcome.unreadable_paths = unreadable_path_count(conn, scan_id)?;
     let base_unreadable = base_unreadable(conn, scan_id)?;
+    outcome.low_space = low_space.load(Ordering::SeqCst);
     if stopped || base_unreadable {
-        let (status, code) = if stopped {
+        let (status, code) = if outcome.low_space {
+            ("partial", "low_space")
+        } else if stopped {
             ("cancelled", "cancelled")
         } else {
             ("partial", "base_unreadable")
@@ -332,7 +346,13 @@ pub fn ingest(
                 now_ns(),
                 outcome.duration_ms as i64,
                 code,
-                if base_unreadable {
+                if outcome.low_space {
+                    format!(
+                        "stopped at the {} MiB free-space floor; \
+                         free space and rerun to resume",
+                        config.minimum_free_space_mib
+                    )
+                } else if base_unreadable {
                     "base directory is unreadable; baseline left unchanged".to_string()
                 } else {
                     format!("{errors} error(s); baseline left unchanged")
@@ -362,6 +382,22 @@ pub fn ingest(
         .map_err(AppError::db)?;
 
     promote(conn, scan_id, base_id, &mut outcome)?;
+
+    // Retention runs after promotion and outside its transaction. Promotion is
+    // the one atomic step that moves the baseline; folding a large delete into
+    // it would stretch the window where a crash discards the whole scan. A
+    // failure here must not undo a scan that already succeeded, so it is
+    // reported and swallowed.
+    if config.keep_scans > 0 {
+        match history::prune_base(conn, config, base_id, true) {
+            Ok(p) => {
+                outcome.pruned_changes = p.changes;
+                outcome.pruned_files = p.files;
+            }
+            Err(e) => eprintln!("metainjester: history prune failed: {}", e.message),
+        }
+    }
+
     outcome.duration_ms = started.elapsed().as_millis() as u64;
     conn.execute(
         "UPDATE scans SET duration_ms = ?1, free_bytes_after = ?2 WHERE scan_id = ?3",
@@ -389,6 +425,7 @@ fn run_pipeline(
     scan_id: i64,
     prior_files: u64,
     cancelled: &Arc<AtomicBool>,
+    low_space: &Arc<AtomicBool>,
     counts: &Arc<Exclusions>,
     hashed: &Arc<AtomicU64>,
     hashed_bytes: &Arc<AtomicU64>,
@@ -448,6 +485,7 @@ fn run_pipeline(
 
         writer(
             conn,
+            db_path,
             config,
             scan_id,
             base_id,
@@ -455,6 +493,7 @@ fn run_pipeline(
             row_rx,
             counts,
             cancelled,
+            low_space,
         )
     })?;
     errors += result;
@@ -608,6 +647,7 @@ fn worker(
 #[allow(clippy::too_many_arguments)]
 fn writer(
     conn: &mut Connection,
+    db_path: &Path,
     config: &Config,
     scan_id: i64,
     base_id: i64,
@@ -615,6 +655,7 @@ fn writer(
     rx: Receiver<WriteMsg>,
     counts: &Arc<Exclusions>,
     cancelled: &AtomicBool,
+    low_space: &AtomicBool,
 ) -> Result<usize, AppError> {
     let mut errors = 0usize;
     let mut processed = 0u64;
@@ -631,6 +672,15 @@ fn writer(
         }
         errors += flush(conn, scan_id, base_id, &mut batch)?;
         processed += 1;
+        // The batch just committed is the last thing written before the floor is
+        // rechecked, so the scan stops with room still left rather than after
+        // taking it. Cancelling is how the walker and the hash workers hear
+        // about it; `low_space` is what tells them apart from a Ctrl-C.
+        if free_bytes(db_path)? < free_space_floor(config) {
+            low_space.store(true, Ordering::SeqCst);
+            cancelled.store(true, Ordering::SeqCst);
+            break;
+        }
         progress.tick(
             counts.discovered_files.load(Ordering::Relaxed),
             processed,
@@ -1062,26 +1112,12 @@ fn hash_file(path: &Path) -> std::io::Result<Vec<u8>> {
 
 /// Design §10: ~4 KiB per expected file, floored at the configured minimum. A
 /// brand-new base has no file count to work from, so only the floor applies.
-fn required_free_bytes(config: &Config, prior_files: u64) -> (u64, String) {
-    let floor = config.minimum_free_space_gib * 1024 * 1024 * 1024;
-    if prior_files == 0 {
-        return (
-            floor,
-            format!(
-                "minimum {} GiB only — a new base has no file count yet \
-                 (scan.initial_average_file_kib = {})",
-                config.minimum_free_space_gib, config.initial_average_file_kib
-            ),
-        );
-    }
-    let estimate = prior_files.saturating_mul(BYTES_PER_EXPECTED_FILE);
-    (
-        estimate.max(floor),
-        format!(
-            "{prior_files} prior files x 4 KiB, floored at minimum {} GiB",
-            config.minimum_free_space_gib
-        ),
-    )
+/// The one space rule. Predicting a scan's appetite needed a file count that
+/// does not exist before the first walk, so nothing predicts any more: the floor
+/// is checked before the scan and again after every committed batch. Stopping
+/// mid-scan is cheap because staging is durable and the next `ingest` resumes.
+fn free_space_floor(config: &Config) -> u64 {
+    config.minimum_free_space_mib.saturating_mul(1024 * 1024)
 }
 
 fn free_bytes(db_path: &Path) -> Result<u64, AppError> {
