@@ -83,6 +83,16 @@ pub struct Config {
     pub keep_scans: u64,
 }
 
+/// The files `load` consults, lowest precedence first. Separate from `load` so
+/// `status` can report which ones exist without reimplementing the search.
+pub fn candidate_files() -> Vec<PathBuf> {
+    let mut files = vec![PathBuf::from(SYSTEM_CONFIG)];
+    if let Some(home) = home_dir() {
+        files.push(home.join(USER_CONFIG_SUFFIX));
+    }
+    files
+}
+
 impl Config {
     /// System file, then user file on top. Both are optional; either being
     /// unreadable-but-present is an error, since silently ignoring a config the
@@ -93,11 +103,7 @@ impl Config {
             storage: None,
             history: None,
         };
-        let mut files = vec![PathBuf::from(SYSTEM_CONFIG)];
-        if let Some(home) = home_dir() {
-            files.push(home.join(USER_CONFIG_SUFFIX));
-        }
-        for path in &files {
+        for path in &candidate_files() {
             if !path.exists() {
                 continue;
             }

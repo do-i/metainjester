@@ -100,6 +100,7 @@ fn main() {
 }
 
 const USAGE: &str = "usage: metainjester ingest <base-path>\n       \
+                     metainjester status\n       \
                      metainjester history prune [--apply]\n  \
                      policy and storage settings come from the configuration file, not flags";
 
@@ -107,6 +108,7 @@ fn run() -> Result<i32, AppError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let raw_base = match args.as_slice() {
         [cmd, path] if cmd == "ingest" => path.clone(),
+        [cmd] if cmd == "status" => return status(),
         // Preview is the default: `prune` alone never deletes anything.
         [a, b] if a == "history" && b == "prune" => return prune(false),
         [a, b, f] if a == "history" && b == "prune" && f == "--apply" => return prune(true),
@@ -148,6 +150,140 @@ fn run() -> Result<i32, AppError> {
         _ if outcome.low_space => EXIT_NO_SPACE,
         _ => EXIT_ERROR,
     })
+}
+
+/// `status`. Read-only and lock-free, so it stays answerable while a scan is
+/// running — which is exactly when you want it. It reports the two things that
+/// otherwise require starting a scan to discover: whether a resumable scan is
+/// waiting, and whether the current configuration still matches each baseline's
+/// inclusion policy.
+fn status() -> Result<i32, AppError> {
+    use rusqlite::OptionalExtension;
+
+    let config = Config::load()?;
+    for path in config::candidate_files() {
+        println!(
+            "config  {}{}",
+            path.display(),
+            if path.exists() { "" } else { "  (absent)" }
+        );
+    }
+    println!(
+        "policy  hidden {}  mounts {}  symlinks {}",
+        if config.skip_hidden { "skip" } else { "include" },
+        if config.skip_mount_boundaries { "skip" } else { "cross" },
+        if config.follow_symlinks { "follow" } else { "skip" }
+    );
+    println!(
+        "limits  free floor {}  keep_scans {}",
+        human(config.minimum_free_space_mib * 1024 * 1024),
+        if config.keep_scans == 0 { "unbounded".to_string() } else { config.keep_scans.to_string() }
+    );
+
+    let opened = db::discover(&config)?;
+    let conn = &opened.conn;
+    db::ensure_schema(conn, &opened.path)?;
+    println!("db      {}", opened.path.display());
+
+    // A live pid here is why the next `ingest` would exit 4; a dead one is
+    // reclaimed automatically and never shown.
+    let holder: Option<i64> = conn
+        .query_row("SELECT pid FROM writer_lock WHERE id = 1", [], |r| r.get(0))
+        .optional()
+        .map_err(AppError::db)?;
+    if let Some(pid) = holder {
+        println!("writer  pid {pid} holds the write lock");
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.base_id, b.base_path, b.skip_hidden, b.skip_mount_boundaries,
+                    b.follow_symlinks, s.scan_id, s.finished_at_ns, s.present_count
+             FROM bases b
+             LEFT JOIN scans s ON s.scan_id = b.last_complete_scan_id
+             ORDER BY b.base_id",
+        )
+        .map_err(AppError::db)?;
+    let bases: Vec<(i64, String, bool, bool, bool, Option<i64>, Option<i64>, Option<i64>)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                r.get(5)?, r.get(6)?, r.get(7)?,
+            ))
+        })
+        .map_err(AppError::db)?
+        .collect::<Result<_, _>>()
+        .map_err(AppError::db)?;
+
+    if bases.is_empty() {
+        println!("no bases yet — `ingest <base-path>` creates one");
+        return Ok(EXIT_OK);
+    }
+
+    for (base_id, base_path, hidden, mounts, symlinks, scan_id, finished, present) in bases {
+        println!("base    {base_path}");
+        match (scan_id, finished) {
+            (Some(id), Some(ns)) => println!(
+                "  baseline  scan {id}, {} ago, {} file(s) present",
+                ago(ns),
+                present.unwrap_or(0)
+            ),
+            _ => println!("  baseline  none — no scan has completed yet"),
+        }
+
+        // Must mirror the resumable query in `scan::ingest`, or status would
+        // promise a resume the scanner does not perform.
+        let resumable: Option<(i64, String, i64)> = conn
+            .query_row(
+                "SELECT scan_id, status, started_at_ns FROM scans
+                 WHERE base_id = ?1 AND status IN ('running','cancelled','failed','partial')
+                 ORDER BY scan_id DESC LIMIT 1",
+                rusqlite::params![base_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(AppError::db)?;
+        match resumable {
+            Some((id, st, started)) => println!(
+                "  resumable scan {id} ({st}, started {} ago) — `ingest {base_path}` continues it",
+                ago(started)
+            ),
+            None => println!("  resumable none"),
+        }
+
+        // The exact comparison behind EXIT_POLICY, surfaced before it refuses.
+        let mut differs = Vec::new();
+        if hidden != config.skip_hidden {
+            differs.push("skip_hidden");
+        }
+        if mounts != config.skip_mount_boundaries {
+            differs.push("skip_mount_boundaries");
+        }
+        if symlinks != config.follow_symlinks {
+            differs.push("follow_symlinks");
+        }
+        if !differs.is_empty() {
+            println!(
+                "  POLICY    {} differ(s) from this baseline; `ingest` will refuse (exit {EXIT_POLICY})",
+                differs.join(", ")
+            );
+        }
+    }
+    Ok(EXIT_OK)
+}
+
+/// Coarse on purpose: status answers "recent or stale?", not "when exactly?".
+fn ago(then_ns: i64) -> String {
+    let secs = (now_ns() - then_ns).max(0) as f64 / 1e9;
+    if secs < 90.0 {
+        format!("{secs:.0}s")
+    } else if secs < 5400.0 {
+        format!("{:.0}m", secs / 60.0)
+    } else if secs < 172_800.0 {
+        format!("{:.1}h", secs / 3600.0)
+    } else {
+        format!("{:.1}d", secs / 86_400.0)
+    }
 }
 
 /// `history prune`. Walks no tree and touches no file — it only bounds what the
