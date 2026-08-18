@@ -29,6 +29,14 @@ const F_ADDED: i64 = F_SIZE | F_MTIME | F_MIME | F_HASH | F_PRESENCE;
 
 const HASH_BUF: usize = 1024 * 1024;
 
+/// The two lookups every hash worker runs, hoisted out of `worker` so the
+/// pipeline can prove they prepare while a failure can still be returned.
+const STAGED_LOOKUP_SQL: &str = "SELECT size_bytes, mtime_ns FROM scan_stage_entries
+     WHERE scan_id = ?1 AND relative_path = ?2 AND complete = 1";
+const BASELINE_LOOKUP_SQL: &str = "SELECT size_bytes, mtime_ns, content_hash FROM files
+     WHERE base_id = ?1 AND relative_path = ?2 AND presence = 'present'
+       AND hash_status = 'complete'";
+
 pub struct Outcome {
     pub scan_id: i64,
     pub resumed: bool,
@@ -483,6 +491,14 @@ fn run_pipeline(
                 (reused_stage.clone(), reused_baseline.clone());
             let changed_during_hash = changed_during_hash.clone();
             let reader = db::open_reader(db_path)?;
+            // A worker that cannot prepare its lookups used to return quietly.
+            // If every worker did that — WAL shared memory unavailable, say —
+            // the scan staged nothing and recorded no error, which is
+            // indistinguishable from a walk of an empty tree, and promotion
+            // recorded the whole baseline as deleted. Prove them here, where
+            // the failure is still a returnable error and no scan is promoted.
+            reader.prepare(STAGED_LOOKUP_SQL).map_err(AppError::db)?;
+            reader.prepare(BASELINE_LOOKUP_SQL).map_err(AppError::db)?;
             scope.spawn(move || {
                 worker(
                     reader,
@@ -505,7 +521,11 @@ fn run_pipeline(
         // because send only fails once every receiver is gone.
         drop(path_rx);
 
-        writer(
+        // A writer that gives up has to say so. Its receiver dropping is not a
+        // signal anyone upstream acts on, so without this the walker and the
+        // hash workers keep going and `thread::scope` cannot return until they
+        // have chewed through the whole tree for output nothing will read.
+        let result = writer(
             conn,
             db_path,
             config,
@@ -516,12 +536,19 @@ fn run_pipeline(
             counts,
             cancelled,
             low_space,
-        )
+        );
+        if result.is_err() {
+            cancelled.store(true, Ordering::SeqCst);
+        }
+        result
     })?;
     errors += result;
     Ok(PipelineResult { errors })
 }
 
+/// One hash worker. Every send is checked: a failed send means the writer is
+/// gone, and continuing past that hashes the rest of the tree into a dead
+/// channel while the scope waits for it.
 #[allow(clippy::too_many_arguments)]
 fn worker(
     reader: Connection,
@@ -536,20 +563,16 @@ fn worker(
     reused_baseline: &AtomicU64,
     changed_during_hash: &AtomicU64,
 ) {
-    let mut staged_lookup = match reader.prepare(
-        "SELECT size_bytes, mtime_ns FROM scan_stage_entries
-         WHERE scan_id = ?1 AND relative_path = ?2 AND complete = 1",
-    ) {
+    // The pipeline already proved these prepare, so reaching the failure arm is
+    // a race with something changing underneath us. It still must not be quiet:
+    // a worker that returns without a word leaves a walk that looks empty.
+    let mut staged_lookup = match reader.prepare(STAGED_LOOKUP_SQL) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => return worker_died(cancelled, tx, e),
     };
-    let mut baseline_lookup = match reader.prepare(
-        "SELECT size_bytes, mtime_ns, content_hash FROM files
-         WHERE base_id = ?1 AND relative_path = ?2 AND presence = 'present'
-           AND hash_status = 'complete'",
-    ) {
+    let mut baseline_lookup = match reader.prepare(BASELINE_LOOKUP_SQL) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => return worker_died(cancelled, tx, e),
     };
 
     loop {
@@ -571,12 +594,17 @@ fn worker(
                 code,
                 message,
             } => {
-                let _ = tx.send(WriteMsg::Error {
-                    rel,
-                    stage: "walk",
-                    code,
-                    message,
-                });
+                if tx
+                    .send(WriteMsg::Error {
+                        rel,
+                        stage: "walk",
+                        code,
+                        message,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
                 continue;
             }
             WalkMsg::Item(item) => item,
@@ -596,7 +624,9 @@ fn worker(
             && m == item.mtime_ns
         {
             reused_stage.fetch_add(1, Ordering::Relaxed);
-            let _ = tx.send(WriteMsg::Reused(item.rel.clone()));
+            if tx.send(WriteMsg::Reused(item.rel.clone())).is_err() {
+                return;
+            }
             continue;
         }
 
@@ -630,38 +660,66 @@ fn worker(
                                     != item.mtime_ns =>
                         {
                             changed_during_hash.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(WriteMsg::Error {
-                                rel: Some(item.rel.clone()),
-                                stage: "hash",
-                                code: "changed_during_hash",
-                                message: "file changed while being hashed".into(),
-                            });
+                            if tx
+                                .send(WriteMsg::Error {
+                                    rel: Some(item.rel.clone()),
+                                    stage: "hash",
+                                    code: "changed_during_hash",
+                                    message: "file changed while being hashed".into(),
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
                             (h, "changed_during_hash")
                         }
                         _ => (h, "complete"),
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(WriteMsg::Error {
-                        rel: Some(item.rel.clone()),
-                        stage: "hash",
-                        code: walk::error_code(&e),
-                        message: e.to_string(),
-                    });
+                    if tx
+                        .send(WriteMsg::Error {
+                            rel: Some(item.rel.clone()),
+                            stage: "hash",
+                            code: walk::error_code(&e),
+                            message: e.to_string(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                     continue;
                 }
             },
         };
 
-        let _ = tx.send(WriteMsg::Row(Box::new(StagedRow {
-            rel: item.rel.clone(),
-            size_bytes: item.size_bytes,
-            mtime_ns: item.mtime_ns,
-            created_ns: item.created_ns,
-            content_hash,
-            hash_status,
-        })));
+        if tx
+            .send(WriteMsg::Row(Box::new(StagedRow {
+                rel: item.rel.clone(),
+                size_bytes: item.size_bytes,
+                mtime_ns: item.mtime_ns,
+                created_ns: item.created_ns,
+                content_hash,
+                hash_status,
+            })))
+            .is_err()
+        {
+            return;
+        }
     }
+}
+
+/// A hash worker that cannot start. Cancelling is what keeps the baseline safe:
+/// it stops the scan short of promotion and keeps the staging for a resume,
+/// rather than letting an empty-looking walk speak for the whole tree.
+fn worker_died(cancelled: &AtomicBool, tx: &SyncSender<WriteMsg>, e: rusqlite::Error) {
+    cancelled.store(true, Ordering::SeqCst);
+    let _ = tx.send(WriteMsg::Error {
+        rel: None,
+        stage: "worker",
+        code: "io_error",
+        message: format!("hash worker could not start: {e}"),
+    });
 }
 
 /// The single staging writer. Commits in batches so an interrupted scan keeps
