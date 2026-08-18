@@ -142,10 +142,11 @@ CREATE INDEX IF NOT EXISTS scan_errors_by_scan ON scan_errors(scan_id);
 ";
 
 /// Convenience views for hand-written queries and SQLiteBrowser. They hold no
-/// data, so they are dropped and rebuilt on every open rather than guarded with
-/// `IF NOT EXISTS` — that way a changed definition can never go stale in an
-/// existing database, and adding one needs no `SCHEMA_VERSION` bump and no
-/// recreation.
+/// data, so they are dropped and rebuilt on every *write* open rather than
+/// guarded with `IF NOT EXISTS` — that way a changed definition can never go
+/// stale in an existing database, and adding one needs no `SCHEMA_VERSION` bump
+/// and no recreation. Rebuilding them is a schema write, so it belongs to
+/// `ensure_schema` and never runs on the read-only path.
 ///
 /// `current_files` exists because the default click in a browser is `SELECT *
 /// FROM files`, which silently includes `deleted` and `unreadable` rows. The
@@ -178,6 +179,11 @@ pub struct Opened {
 /// Discovery per design §2: a current-directory database wins, but only if it
 /// proves it belongs to this application. An unrelated SQLite file in the
 /// working directory is a hard error — never silently adopted.
+///
+/// This is the *writing* entry point, and the only one allowed to create a
+/// directory or initialise a file. Read-only commands use `existing_path` +
+/// `open_readonly` so that running `status` in a fresh directory reports that
+/// there is no database rather than quietly producing one.
 pub fn discover(config: &Config) -> Result<Opened, AppError> {
     let cwd_db = std::env::current_dir()
         .map_err(|e| AppError::io(format!("cannot read current directory: {e}")))?
@@ -347,6 +353,66 @@ pub fn ensure_schema(conn: &Connection, path: &Path) -> Result<(), AppError> {
              rm {}*",
             path.display()
         ))),
+    }
+}
+
+/// The read-only half of `ensure_schema`: check the version and stamp nothing.
+/// A read-only command must be able to refuse an unreadable schema without
+/// writing to say so — and on a connection opened read-only the write would
+/// fail anyway.
+pub fn check_schema(conn: &Connection, path: &Path) -> Result<(), AppError> {
+    let version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM application_metadata WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(AppError::db)?;
+    match version.as_deref() {
+        // An unstamped database predates versioning. Only `ingest` may stamp it,
+        // so a read-only command accepts it and moves on.
+        None | Some(SCHEMA_VERSION) => Ok(()),
+        Some(other) => Err(AppError::config(format!(
+            "database schema_version is {other}, this build needs {SCHEMA_VERSION}.\n  \
+             this POC has no migrations yet — delete the database and ingest again:\n  \
+             rm {}*",
+            path.display()
+        ))),
+    }
+}
+
+/// The database a read-only command would use, found without bringing one into
+/// existence. `None` means there is nothing to report on yet — a fact `status`
+/// prints rather than fixes.
+pub fn existing_path(config: &Config) -> Result<Option<PathBuf>, AppError> {
+    let cwd_db = std::env::current_dir()
+        .map_err(|e| AppError::io(format!("cannot read current directory: {e}")))?
+        .join(CWD_DB);
+    if cwd_db.exists() {
+        return Ok(Some(cwd_db));
+    }
+    if config.database_path.exists() {
+        return Ok(Some(config.database_path.clone()));
+    }
+    Ok(None)
+}
+
+/// Opens an existing database for a command that promises not to write. The
+/// read-only flag is what makes the promise enforceable rather than merely
+/// intended: no `journal_mode` pragma write, no view rebuild, no schema stamp.
+/// That matters because `status` is the command you run *while* a scan is
+/// running — anything here that opened a write transaction would queue behind
+/// the scan's next batch, and would fail outright on a read-only mount.
+pub fn open_readonly(path: &Path) -> Result<Connection, AppError> {
+    let conn = open_reader(path)?;
+    match ownership(&conn)? {
+        Ownership::Ours => Ok(conn),
+        Ownership::Empty if is_empty_db(&conn)? => Err(AppError::config(format!(
+            "{} is empty — `ingest <base-path>` initialises it",
+            path.display()
+        ))),
+        _ => Err(AppError::not_ours(path.to_path_buf())),
     }
 }
 

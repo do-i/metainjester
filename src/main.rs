@@ -180,10 +180,17 @@ fn status() -> Result<i32, AppError> {
         if config.keep_scans == 0 { "unbounded".to_string() } else { config.keep_scans.to_string() }
     );
 
-    let opened = db::discover(&config)?;
-    let conn = &opened.conn;
-    db::ensure_schema(conn, &opened.path)?;
-    println!("db      {}", opened.path.display());
+    // Read-only for real, not just by intent. `discover` + `ensure_schema` would
+    // create the directory and file if absent and then take the write lock to
+    // rebuild views — which contends with the very scan this command exists to
+    // report on, and turns "you have no database" into "you do now".
+    let Some(db_path) = db::existing_path(&config)? else {
+        println!("db      none yet — `ingest <base-path>` creates one");
+        return Ok(EXIT_OK);
+    };
+    let conn = db::open_readonly(&db_path)?;
+    db::check_schema(&conn, &db_path)?;
+    println!("db      {}", db_path.display());
 
     // A live pid here is why the next `ingest` would exit 4; a dead one is
     // reclaimed automatically and never shown.
@@ -291,10 +298,24 @@ fn ago(then_ns: i64) -> String {
 /// `keep_scans` without waiting for the next scan.
 fn prune(apply: bool) -> Result<i32, AppError> {
     let config = Config::load()?;
-    let opened = db::discover(&config)?;
-    db::ensure_schema(&opened.conn, &opened.path)?;
+    // The preview counts; only `--apply` deletes. So only `--apply` opens for
+    // writing — a preview must not create a database, rebuild views, or reach
+    // for the write lock a running scan is holding.
+    let (conn, db_path) = if apply {
+        let opened = db::discover(&config)?;
+        db::ensure_schema(&opened.conn, &opened.path)?;
+        (opened.conn, opened.path)
+    } else {
+        let Some(path) = db::existing_path(&config)? else {
+            println!("db      none yet — `ingest <base-path>` creates one");
+            return Ok(EXIT_OK);
+        };
+        let conn = db::open_readonly(&path)?;
+        db::check_schema(&conn, &path)?;
+        (conn, path)
+    };
 
-    println!("db      {}", opened.path.display());
+    println!("db      {}", db_path.display());
     if config.keep_scans == 0 {
         println!("policy  history.keep_scans = 0 — history is kept forever, nothing to prune");
         println!("  set [history] keep_scans = N in the configuration file to bound it");
@@ -305,11 +326,11 @@ fn prune(apply: bool) -> Result<i32, AppError> {
     // The lock is only taken to delete. A preview is read-only, so it stays
     // available while a scan is running.
     if apply {
-        db::acquire_writer_lock(&opened.conn)?;
+        db::acquire_writer_lock(&conn)?;
     }
-    let result = history::prune_all(&opened.conn, &config, apply);
+    let result = history::prune_all(&conn, &config, apply);
     if apply {
-        db::release_writer_lock(&opened.conn);
+        db::release_writer_lock(&conn);
     }
     let bases = result?;
 
@@ -343,7 +364,7 @@ fn prune(apply: bool) -> Result<i32, AppError> {
             "removed {total} row(s). The file will not shrink — freed pages are reused, so it \
              stops growing.\n  to reclaim the bytes: sqlite3 {} \"VACUUM INTO 'new.sqlite3'\" \
              then swap it in",
-            opened.path.display()
+            db_path.display()
         );
     } else {
         println!("preview only — rerun with --apply to delete");

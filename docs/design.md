@@ -88,8 +88,9 @@ attempts.
 `current_files` filters to `presence = 'present'` and joins an absolute path,
 because the obvious `SELECT * FROM files` silently includes deleted and
 unreadable rows. Views hold no data, so they are dropped and rebuilt on every
-open — a changed definition cannot go stale, and adding one needs no
-`SCHEMA_VERSION` bump.
+*write* open — a changed definition cannot go stale, and adding one needs no
+`SCHEMA_VERSION` bump. Rebuilding is itself a write, so the read-only commands
+open read-only and skip it rather than contend for the write lock.
 
 Privacy is out of scope at the application level: the database is plain SQLite so
 SQLiteBrowser works. Put it in a LUKS container if it needs protection.
