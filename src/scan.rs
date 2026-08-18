@@ -386,13 +386,20 @@ pub fn ingest(
         params![scan_id],
     )
     .map_err(AppError::db)?;
-    outcome.staged = conn
+    // Same row scan as before, now also summing, so `scans.staged_files` can be
+    // corrected from it. The counts written before the cleanup are the truth for
+    // a scan that stops early — its staging is kept exactly as it stands — but a
+    // scan that reaches here has just dropped rows the re-walk did not see, and
+    // the stored columns would otherwise keep claiming them.
+    let (staged_after, staged_bytes_after): (usize, i64) = conn
         .query_row(
-            "SELECT COUNT(*) FROM scan_stage_entries WHERE scan_id = ?1 AND complete = 1",
+            "SELECT COUNT(*), IFNULL(SUM(size_bytes), 0) FROM scan_stage_entries
+             WHERE scan_id = ?1 AND complete = 1",
             params![scan_id],
-            |r| r.get::<_, i64>(0).map(|n| n as usize),
+            |r| Ok((r.get::<_, i64>(0)? as usize, r.get(1)?)),
         )
         .map_err(AppError::db)?;
+    outcome.staged = staged_after;
 
     promote(conn, scan_id, base_id, &mut outcome)?;
 
@@ -413,11 +420,15 @@ pub fn ingest(
 
     outcome.duration_ms = started.elapsed().as_millis() as u64;
     conn.execute(
-        "UPDATE scans SET duration_ms = ?1, free_bytes_after = ?2 WHERE scan_id = ?3",
+        "UPDATE scans SET duration_ms = ?1, free_bytes_after = ?2,
+             staged_files = ?4, staged_bytes = ?5
+         WHERE scan_id = ?3",
         params![
             outcome.duration_ms as i64,
             free_bytes(db_path).unwrap_or(0) as i64,
-            scan_id
+            scan_id,
+            staged_after as i64,
+            staged_bytes_after
         ],
     )
     .map_err(AppError::db)?;
