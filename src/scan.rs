@@ -761,8 +761,14 @@ fn writer(
                 Err(_) => break,
             }
         }
+        // Errors are not files, so they do not count toward a total drawn from
+        // a previous scan's file count.
+        let files = batch
+            .iter()
+            .filter(|m| !matches!(m, WriteMsg::Error { .. }))
+            .count() as u64;
         errors += flush(conn, scan_id, base_id, &mut batch)?;
-        processed += 1;
+        processed += files;
         // The batch just committed is the last thing written before the floor is
         // rechecked, so the scan stops with room still left rather than after
         // taking it. Cancelling is how the walker and the hash workers hear
@@ -1138,11 +1144,13 @@ fn promote(
     Ok(())
 }
 
-/// An exact percentage would need a second full traversal, so a fresh scan shows
-/// discovery instead. A rescan starts from the prior completed file count.
+/// Count over total. The only total available before the walk finishes is the
+/// previous scan's file count — an exact one would need a second full traversal
+/// — so it is shown as an estimate and dropped entirely once exceeded, rather
+/// than reporting a percentage above 100. A first scan has no prior count and
+/// shows discovery alone.
 struct Progress {
     prior_files: u64,
-    started: Instant,
     last: Instant,
     active: bool,
     tty: bool,
@@ -1152,7 +1160,6 @@ impl Progress {
     fn new(prior_files: u64) -> Progress {
         Progress {
             prior_files,
-            started: Instant::now(),
             last: Instant::now(),
             active: false,
             // A redraw needs a terminal to redraw over; piped output gets none.
@@ -1169,16 +1176,16 @@ impl Progress {
         }
         self.last = Instant::now();
         self.active = true;
-        let secs = self.started.elapsed().as_secs_f64().max(0.001);
-        let rate = processed as f64 / secs;
-        let eta = if self.prior_files > 0 && processed > 0 && processed < self.prior_files {
-            format!("  eta ~{:.0}s", (self.prior_files - processed) as f64 / rate.max(0.001))
+        let of_total = if self.prior_files > 0 && processed <= self.prior_files {
+            format!(
+                " / ~{} ({:.0}%)",
+                self.prior_files,
+                processed as f64 / self.prior_files as f64 * 100.0
+            )
         } else {
             String::new()
         };
-        eprint!(
-            "\r  discovered {discovered}  processed {processed}  {rate:.0}/s{eta}          "
-        );
+        eprint!("\r  discovered {discovered}  processed {processed}{of_total}          ");
     }
 
     fn finish(&mut self) {
