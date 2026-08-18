@@ -198,7 +198,10 @@ fn status() -> Result<i32, AppError> {
         .query_row("SELECT pid FROM writer_lock WHERE id = 1", [], |r| r.get(0))
         .optional()
         .map_err(AppError::db)?;
-    if let Some(pid) = holder {
+    // A row whose pid is gone is not a held lock — `acquire_writer_lock`
+    // reclaims it without a word, so reporting it here would send the user
+    // hunting for a scan that already ended.
+    if let Some(pid) = holder.filter(|p| db::pid_alive(*p)) {
         println!("writer  pid {pid} holds the write lock");
     }
 

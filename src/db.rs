@@ -446,6 +446,9 @@ pub fn release_writer_lock(conn: &Connection) {
     let _ = conn.execute("DELETE FROM writer_lock WHERE id = 1 AND pid = ?1", params![pid]);
 }
 
-fn pid_alive(pid: i64) -> bool {
+/// Public because `status` must answer the same question `acquire_writer_lock`
+/// does. A row left by a killed process is not a held lock, and reporting it as
+/// one sends the user hunting for a scan that ended.
+pub fn pid_alive(pid: i64) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
