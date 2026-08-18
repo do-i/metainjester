@@ -45,6 +45,9 @@ pub struct Outcome {
     pub reused_baseline: u64,
     pub errors: usize,
     pub low_space: bool,
+    /// Why a scan can stop with no errors of its own worth listing: the base
+    /// itself went unread, which shields the whole baseline from promotion.
+    pub base_unreadable: bool,
     pub pruned_changes: u64,
     pub pruned_files: u64,
     pub unreadable: usize,
@@ -304,6 +307,7 @@ pub fn ingest(
         reused_baseline: reused_baseline.load(Ordering::Relaxed),
         errors,
         low_space: false,
+        base_unreadable: false,
         pruned_changes: 0,
         pruned_files: 0,
         unreadable: 0,
@@ -327,6 +331,7 @@ pub fn ingest(
     outcome.unreadable_paths = unreadable_path_count(conn, scan_id)?;
     let base_unreadable = base_unreadable(conn, scan_id)?;
     outcome.low_space = low_space.load(Ordering::SeqCst);
+    outcome.base_unreadable = base_unreadable;
     if stopped || base_unreadable {
         let (status, code) = if outcome.low_space {
             ("partial", "low_space")
@@ -444,9 +449,26 @@ fn run_pipeline(
             let counts = counts.clone();
             let cancelled = cancelled.clone();
             let tx = path_tx.clone();
+            // `Walker::new` consumes the sender, so reporting its failure needs
+            // a second clone.
+            let err_tx = path_tx.clone();
             scope.spawn(move || match Walker::new(base, config, tx, &cancelled, counts) {
                 Ok(mut w) => w.run(),
-                Err(e) => eprintln!("metainjester: cannot stat base: {e}"),
+                // A base we cannot stat is a base we cannot read, and it
+                // prefixes every path in the baseline. This must travel the
+                // same channel as a failed `read_dir` on the base — an error
+                // row on the empty relative path — because that row is the only
+                // thing `base_unreadable` looks for when it decides whether
+                // promotion may proceed. Printing the error instead would leave
+                // a scan that looks like a successful walk of an empty tree,
+                // and promotion would then record the entire baseline deleted.
+                Err(e) => {
+                    let _ = err_tx.send(WalkMsg::Error {
+                        rel: Some(Vec::new()),
+                        code: walk::error_code(&e),
+                        message: format!("cannot stat base: {e}"),
+                    });
+                }
             });
         }
         drop(path_tx);
@@ -816,20 +838,22 @@ fn unreadable_path_count(conn: &Connection, scan_id: i64) -> Result<usize, AppEr
 
 /// True when the walk could not read the base itself, which arrives as an error
 /// on the empty relative path.
+///
+/// Any error code counts here, unlike the `UNREADABLE_CODES` that shield paths
+/// deeper in the tree. Nothing can produce a row on the empty relative path
+/// having actually enumerated the base, so its presence always means the base
+/// went unread — and an unread base prefixes every path in the baseline at
+/// once. Refusing costs one rerun; promoting on this evidence records the whole
+/// tree as deleted, which is the expensive direction to be wrong in.
 fn base_unreadable(conn: &Connection, scan_id: i64) -> Result<bool, AppError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT error_code FROM scan_errors
-             WHERE scan_id = ?1 AND relative_path IS NOT NULL AND length(relative_path) = 0",
-        )
-        .map_err(AppError::db)?;
-    let mut rows = stmt.query(params![scan_id]).map_err(AppError::db)?;
-    while let Some(row) = rows.next().map_err(AppError::db)? {
-        if walk::unreadable(&row.get::<_, String>(0).map_err(AppError::db)?) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM scan_errors
+                        WHERE scan_id = ?1 AND relative_path IS NOT NULL
+                          AND length(relative_path) = 0)",
+        params![scan_id],
+        |r| r.get::<_, i64>(0).map(|n| n != 0),
+    )
+    .map_err(AppError::db)
 }
 
 /// SQL predicate: `alias`'s path is an unreadable path from this scan, or lies

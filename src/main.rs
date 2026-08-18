@@ -441,6 +441,14 @@ fn report(db_path: &std::path::Path, base: &std::path::Path, config: &Config, o:
                 human(o.required_free)
             );
         }
+        // Otherwise this failure is invisible: an unread base stages nothing, so
+        // the counts above look like a clean scan of an empty tree.
+        if o.base_unreadable {
+            println!(
+                "stopped: could not read the base itself — every path in the baseline \
+                 depends on it, so nothing was promoted"
+            );
+        }
         println!("baseline unchanged; rerun `ingest` on the same path to resume");
         if o.errors > 0 {
             println!("  see: SELECT stage, error_code, message FROM scan_errors WHERE scan_id = {};", o.scan_id);

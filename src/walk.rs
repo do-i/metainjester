@@ -227,17 +227,13 @@ pub fn system_time_ns(t: Option<std::time::SystemTime>) -> Option<i64> {
         .map(|d| d.as_nanos() as i64)
 }
 
-/// Bounded error codes, so `scan_errors.error_code` stays a small enum rather
-/// than free text.
+/// The codes that mean a path's contents are unknown, rather than known-absent.
+/// This is the only distinction promotion cares about *below* the base: an
+/// unreadable path leaves the baseline under it untrustworthy and so shields it,
+/// while a path that merely vanished leaves nothing in doubt and must not hold
+/// the whole scan hostage. The base itself is judged differently — see
+/// `scan::base_unreadable`.
 pub const UNREADABLE_CODES: [&str; 3] = ["permission_denied", "io_error", "invalid_data"];
-
-/// Splits the bounded codes into the only distinction promotion cares about.
-/// An unreadable path leaves its contents unknown, so the baseline under it
-/// cannot be trusted; a path that merely vanished or changed under us leaves
-/// nothing in doubt and must not hold the whole scan hostage.
-pub fn unreadable(code: &str) -> bool {
-    UNREADABLE_CODES.contains(&code)
-}
 
 pub fn error_code(e: &std::io::Error) -> &'static str {
     match e.kind() {
