@@ -6,9 +6,9 @@ use std::collections::HashSet;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use crate::config::Config;
@@ -22,7 +22,7 @@ pub struct Observed {
 }
 
 pub enum WalkMsg {
-    Item(Box<Observed>),
+    Item(Observed),
     Error {
         rel: Option<Vec<u8>>,
         code: &'static str,
@@ -30,26 +30,34 @@ pub enum WalkMsg {
     },
 }
 
+/// Every counter the pipeline shares, in one allocation. The walker fills the
+/// discovery and exclusion halves, the hash workers the reuse half; keeping them
+/// together is what lets a thread carry one `Arc` instead of seven.
 #[derive(Default)]
-pub struct Exclusions {
+pub struct Counters {
     pub hidden: AtomicU64,
     pub mount: AtomicU64,
     pub symlink: AtomicU64,
     pub discovered_files: AtomicU64,
     pub discovered_bytes: AtomicU64,
+    pub hashed: AtomicU64,
+    pub hashed_bytes: AtomicU64,
+    pub reused_stage: AtomicU64,
+    pub reused_baseline: AtomicU64,
+    pub changed_during_hash: AtomicU64,
 }
 
 pub struct Walker<'a> {
-    pub base: &'a Path,
-    pub config: &'a Config,
-    pub tx: SyncSender<WalkMsg>,
-    pub cancelled: &'a AtomicBool,
-    pub counts: Arc<Exclusions>,
+    base: &'a Path,
+    config: &'a Config,
+    tx: SyncSender<WalkMsg>,
+    cancelled: &'a AtomicBool,
+    counts: Arc<Counters>,
     base_dev: u64,
     visited_dirs: HashSet<(u64, u64)>,
     /// Set when the queue's receivers are gone, which means the run is over and
     /// there is nothing left to walk for.
-    downstream_gone: AtomicBool,
+    downstream_gone: bool,
 }
 
 impl<'a> Walker<'a> {
@@ -58,7 +66,7 @@ impl<'a> Walker<'a> {
         config: &'a Config,
         tx: SyncSender<WalkMsg>,
         cancelled: &'a AtomicBool,
-        counts: Arc<Exclusions>,
+        counts: Arc<Counters>,
     ) -> std::io::Result<Self> {
         let base_dev = std::fs::metadata(base)?.dev();
         Ok(Walker {
@@ -69,7 +77,7 @@ impl<'a> Walker<'a> {
             counts,
             base_dev,
             visited_dirs: HashSet::new(),
-            downstream_gone: AtomicBool::new(false),
+            downstream_gone: false,
         })
     }
 
@@ -86,16 +94,23 @@ impl<'a> Walker<'a> {
             .to_vec()
     }
 
-    fn send(&self, msg: WalkMsg) -> bool {
+    fn send(&mut self, msg: WalkMsg) {
         if self.tx.send(msg).is_err() {
-            self.downstream_gone.store(true, Ordering::Relaxed);
-            return false;
+            self.downstream_gone = true;
         }
-        true
+    }
+
+    fn send_err(&mut self, path: &Path, e: &std::io::Error) {
+        let rel = self.rel_of(path);
+        self.send(WalkMsg::Error {
+            rel: Some(rel),
+            code: error_code(e),
+            message: e.to_string(),
+        });
     }
 
     fn should_stop(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed) || self.downstream_gone.load(Ordering::Relaxed)
+        self.cancelled.load(Ordering::Relaxed) || self.downstream_gone
     }
 
     fn walk(&mut self, dir: &Path) {
@@ -104,14 +119,7 @@ impl<'a> Walker<'a> {
         }
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
-            Err(e) => {
-                self.send(WalkMsg::Error {
-                    rel: Some(self.rel_of(dir)),
-                    code: error_code(&e),
-                    message: e.to_string(),
-                });
-                return;
-            }
+            Err(e) => return self.send_err(dir, &e),
         };
 
         for entry in entries {
@@ -121,11 +129,7 @@ impl<'a> Walker<'a> {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    self.send(WalkMsg::Error {
-                        rel: Some(self.rel_of(dir)),
-                        code: error_code(&e),
-                        message: e.to_string(),
-                    });
+                    self.send_err(dir, &e);
                     continue;
                 }
             };
@@ -141,44 +145,44 @@ impl<'a> Walker<'a> {
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    self.send(WalkMsg::Error {
-                        rel: Some(self.rel_of(&path)),
-                        code: error_code(&e),
-                        message: e.to_string(),
-                    });
+                    self.send_err(&path, &e);
                     continue;
                 }
             };
 
             if meta.file_type().is_symlink() {
-                if !self.config.follow_symlinks {
-                    self.counts.symlink.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                match std::fs::metadata(&path) {
-                    Ok(target) => {
-                        if target.is_dir() {
-                            self.enter_dir(&path, &target);
-                        } else if target.is_file() {
-                            self.emit(&path, &target);
-                        }
-                    }
-                    Err(e) => self.send_err(&path, &e),
-                }
-                continue;
-            }
-
-            if meta.is_dir() {
+                self.visit_symlink(&path);
+            } else if meta.is_dir() {
                 self.enter_dir(&path, &meta);
             } else if meta.is_file() {
-                if self.crosses_mount(&meta) {
-                    self.counts.mount.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                self.emit(&path, &meta);
+                self.visit_file(&path, &meta);
             }
             // Sockets, FIFOs, and devices are not eligible regular files.
         }
+    }
+
+    fn visit_symlink(&mut self, path: &Path) {
+        if !self.config.follow_symlinks {
+            self.counts.symlink.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        match std::fs::metadata(path) {
+            Ok(target) if target.is_dir() => self.enter_dir(path, &target),
+            // Deliberately not `visit_file`: a followed symlink to a file has
+            // never been subject to the mount check, only one to a directory
+            // has. Preserved as-is rather than quietly widening exclusion.
+            Ok(target) if target.is_file() => self.emit(path, &target),
+            Ok(_) => {}
+            Err(e) => self.send_err(path, &e),
+        }
+    }
+
+    fn visit_file(&mut self, path: &Path, meta: &std::fs::Metadata) {
+        if self.crosses_mount(meta) {
+            self.counts.mount.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.emit(path, meta);
     }
 
     fn enter_dir(&mut self, path: &Path, meta: &std::fs::Metadata) {
@@ -198,27 +202,20 @@ impl<'a> Walker<'a> {
         self.config.skip_mount_boundaries && meta.dev() != self.base_dev
     }
 
-    fn send_err(&self, path: &Path, e: &std::io::Error) {
-        self.send(WalkMsg::Error {
-            rel: Some(self.rel_of(path)),
-            code: error_code(e),
-            message: e.to_string(),
-        });
-    }
-
-    fn emit(&self, path: &Path, meta: &std::fs::Metadata) {
+    fn emit(&mut self, path: &Path, meta: &std::fs::Metadata) {
         let size = meta.len() as i64;
         self.counts.discovered_files.fetch_add(1, Ordering::Relaxed);
         self.counts
             .discovered_bytes
             .fetch_add(size as u64, Ordering::Relaxed);
-        self.send(WalkMsg::Item(Box::new(Observed {
-            rel: self.rel_of(path),
+        let rel = self.rel_of(path);
+        self.send(WalkMsg::Item(Observed {
+            rel,
             path: path.to_path_buf(),
             size_bytes: size,
             mtime_ns: system_time_ns(meta.modified().ok()).unwrap_or(0),
             created_ns: system_time_ns(meta.created().ok()),
-        })));
+        }));
     }
 }
 
@@ -244,27 +241,44 @@ pub fn error_code(e: &std::io::Error) -> &'static str {
     }
 }
 
-/// Base-relative path split into the SQL search helpers. These are lossy TEXT on
-/// purpose: `relative_path` stays the exact BINARY identity, these exist to make
-/// SQLiteBrowser queries pleasant.
-pub fn helpers(rel: &[u8]) -> (Option<String>, Option<String>, Option<String>) {
+/// Base-relative path split into the SQL search helpers, plus the MIME guess
+/// that extension implies. One lossy decode serves all four: `relative_path`
+/// stays the exact BINARY identity, these exist to make SQLiteBrowser queries
+/// pleasant, and the MIME guess is extension-based only — it never opens the
+/// file (design §3).
+pub struct Helpers {
+    pub parent: Option<String>,
+    pub name: String,
+    pub extension: Option<String>,
+    pub mime_type: Option<String>,
+    pub mime_source: &'static str,
+}
+
+pub fn helpers(rel: &[u8]) -> Helpers {
     let s = String::from_utf8_lossy(rel);
     let (parent, name) = match s.rfind('/') {
         Some(i) => (Some(s[..i].to_string()), s[i + 1..].to_string()),
-        None => (None, s.to_string()),
+        None => (None, s.into_owned()),
     };
-    let ext = name
+    // `Path::extension` semantics: a leading dot is a stem, a trailing one is
+    // not an extension. `mime_guess` matches case-insensitively, so the
+    // lowercased helper column is the same key `from_path` would have used.
+    let extension = name
         .rfind('.')
         .filter(|i| *i > 0 && *i + 1 < name.len())
         .map(|i| name[i + 1..].to_ascii_lowercase());
-    (parent, Some(name), ext)
-}
-
-/// Extension-based only, recorded honestly. Never opens the file (design §3).
-pub fn mime_of(rel: &[u8]) -> (Option<String>, &'static str) {
-    let name = String::from_utf8_lossy(rel).to_string();
-    match mime_guess::from_path(&name).first() {
-        Some(m) => (Some(m.essence_str().to_string()), "extension"),
+    let (mime_type, mime_source) = match extension.as_deref().map(mime_guess::from_ext) {
+        Some(guess) => match guess.first() {
+            Some(m) => (Some(m.essence_str().to_string()), "extension"),
+            None => (None, "unknown"),
+        },
         None => (None, "unknown"),
+    };
+    Helpers {
+        parent,
+        name,
+        extension,
+        mime_type,
+        mime_source,
     }
 }

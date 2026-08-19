@@ -214,9 +214,8 @@ pub fn discover(config: &Config) -> Result<Opened, AppError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            AppError::io(format!("cannot create {}: {e}", parent.display()))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::io(format!("cannot create {}: {e}", parent.display())))?;
     }
     let existed = path.exists();
     let conn = open_conn(path)?;
@@ -277,8 +276,7 @@ fn is_empty_db(conn: &Connection) -> Result<bool, AppError> {
 }
 
 fn open_conn(path: &Path) -> Result<Connection, AppError> {
-    let conn = Connection::open(path)
-        .map_err(|e| AppError::db_at(path, e))?;
+    let conn = Connection::open(path).map_err(|e| AppError::db_at(path, e))?;
     apply_pragmas(&conn)?;
     Ok(conn)
 }
@@ -450,5 +448,5 @@ pub fn release_writer_lock(conn: &Connection) {
 /// does. A row left by a killed process is not a held lock, and reporting it as
 /// one sends the user hunting for a scan that ended.
 pub fn pid_alive(pid: i64) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    std::fs::exists(format!("/proc/{pid}")).unwrap_or(false)
 }

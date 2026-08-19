@@ -82,8 +82,10 @@ pub fn prune_base(
     let file_where = "base_id = ?1 AND presence = 'deleted' AND deleted_in_scan_id < ?2";
 
     if apply {
-        out.changes = delete_batched(conn, "scan_changes", "change_id", change_where, base_id, cutoff, config.writer_batch_rows)?;
-        out.files = delete_batched(conn, "files", "file_id", file_where, base_id, cutoff, config.writer_batch_rows)?;
+        let batch = config.writer_batch_rows;
+        out.changes =
+            delete_batched(conn, "scan_changes", "change_id", change_where, base_id, cutoff, batch)?;
+        out.files = delete_batched(conn, "files", "file_id", file_where, base_id, cutoff, batch)?;
     } else {
         out.changes = count(conn, "scan_changes", change_where, base_id, cutoff)?;
         out.files = count(conn, "files", file_where, base_id, cutoff)?;
@@ -147,7 +149,6 @@ fn count(
 ///
 /// `DELETE ... LIMIT` needs a compile-time option the system SQLite may not
 /// have, hence the subquery.
-#[allow(clippy::too_many_arguments)]
 fn delete_batched(
     conn: &Connection,
     table: &str,

@@ -32,7 +32,7 @@ impl AutoOr {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFile {
     #[serde(default)]
@@ -43,7 +43,7 @@ struct RawFile {
     history: Option<RawHistory>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawScan {
     workers: Option<AutoOr>,
@@ -55,14 +55,14 @@ struct RawScan {
     follow_symlinks: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawStorage {
     database_path: Option<String>,
     minimum_free_space_mib: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawHistory {
     keep_scans: Option<u64>,
@@ -98,11 +98,7 @@ impl Config {
     /// unreadable-but-present is an error, since silently ignoring a config the
     /// user wrote is worse than refusing to start.
     pub fn load() -> Result<Config, AppError> {
-        let mut merged = RawFile {
-            scan: None,
-            storage: None,
-            history: None,
-        };
+        let mut merged = RawFile::default();
         for path in &candidate_files() {
             if !path.exists() {
                 continue;
@@ -119,27 +115,16 @@ impl Config {
     }
 
     fn resolve(raw: RawFile) -> Result<Config, AppError> {
-        let scan = raw.scan.unwrap_or(RawScan {
-            workers: None,
-            writer_batch_rows: None,
-            throttle_ms_after_batch: None,
-            hash_policy: None,
-            skip_hidden: None,
-            skip_mount_boundaries: None,
-            follow_symlinks: None,
-        });
-        let storage = raw.storage.unwrap_or(RawStorage {
-            database_path: None,
-            minimum_free_space_mib: None,
-        });
-        let history = raw.history.unwrap_or(RawHistory { keep_scans: None });
+        let scan = raw.scan.unwrap_or_default();
+        let storage = raw.storage.unwrap_or_default();
+        let history = raw.history.unwrap_or_default();
 
         // auto = min(4, max(1, logical_cpus / 2)); more workers usually buys disk
         // contention rather than throughput.
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get() as u64)
             .unwrap_or(1);
-        let auto_workers = 4.min(1.max(cpus / 2));
+        let auto_workers = (cpus / 2).clamp(1, 4);
         let workers = match scan.workers {
             Some(v) => v.resolve("scan.workers", auto_workers)?,
             None => auto_workers,
@@ -184,57 +169,42 @@ impl Config {
     }
 }
 
+/// Lays one file's section over the accumulated one, key by key. A key the
+/// higher-precedence file omits must keep the value below it, which is why this
+/// cannot be a whole-section replace.
+macro_rules! overlay {
+    ($slot:expr, $from:expr, $($field:ident),+ $(,)?) => {{
+        let from = $from;
+        match $slot.as_mut() {
+            None => $slot = Some(from),
+            Some(into) => {
+                $(if from.$field.is_some() {
+                    into.$field = from.$field;
+                })+
+            }
+        }
+    }};
+}
+
 fn merge(into: &mut RawFile, from: RawFile) {
     if let Some(s) = from.scan {
-        match into.scan.as_mut() {
-            None => into.scan = Some(s),
-            Some(t) => {
-                if s.workers.is_some() {
-                    t.workers = s.workers;
-                }
-                if s.writer_batch_rows.is_some() {
-                    t.writer_batch_rows = s.writer_batch_rows;
-                }
-                if s.throttle_ms_after_batch.is_some() {
-                    t.throttle_ms_after_batch = s.throttle_ms_after_batch;
-                }
-                if s.hash_policy.is_some() {
-                    t.hash_policy = s.hash_policy;
-                }
-                if s.skip_hidden.is_some() {
-                    t.skip_hidden = s.skip_hidden;
-                }
-                if s.skip_mount_boundaries.is_some() {
-                    t.skip_mount_boundaries = s.skip_mount_boundaries;
-                }
-                if s.follow_symlinks.is_some() {
-                    t.follow_symlinks = s.follow_symlinks;
-                }
-            }
-        }
+        overlay!(
+            into.scan,
+            s,
+            workers,
+            writer_batch_rows,
+            throttle_ms_after_batch,
+            hash_policy,
+            skip_hidden,
+            skip_mount_boundaries,
+            follow_symlinks,
+        );
     }
     if let Some(s) = from.storage {
-        match into.storage.as_mut() {
-            None => into.storage = Some(s),
-            Some(t) => {
-                if s.database_path.is_some() {
-                    t.database_path = s.database_path;
-                }
-                if s.minimum_free_space_mib.is_some() {
-                    t.minimum_free_space_mib = s.minimum_free_space_mib;
-                }
-            }
-        }
+        overlay!(into.storage, s, database_path, minimum_free_space_mib);
     }
     if let Some(s) = from.history {
-        match into.history.as_mut() {
-            None => into.history = Some(s),
-            Some(t) => {
-                if s.keep_scans.is_some() {
-                    t.keep_scans = s.keep_scans;
-                }
-            }
-        }
+        overlay!(into.history, s, keep_scans);
     }
 }
 
@@ -263,9 +233,9 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     let Some(home) = home_dir() else {
         return PathBuf::from(path);
     };
-    match path {
-        "~" => home,
-        p if p.starts_with("~/") => home.join(&p[2..]),
-        p => PathBuf::from(p),
+    match path.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None if path == "~" => home,
+        None => PathBuf::from(path),
     }
 }
