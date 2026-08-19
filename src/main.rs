@@ -192,19 +192,43 @@ fn status() -> Result<i32, AppError> {
     db::check_schema(&conn, &db_path)?;
     println!("db      {}", db_path.display());
 
-    // A live pid here is why the next `ingest` would exit 4; a dead one is
-    // reclaimed automatically and never shown.
+    // A live pid here is why the next `ingest` would exit 4. A dead one is not a
+    // held lock at all — see `db::pid_alive` — so it is filtered out rather than
+    // reported.
     let holder: Option<i64> = conn
         .query_row("SELECT pid FROM writer_lock WHERE id = 1", [], |r| r.get(0))
         .optional()
         .map_err(AppError::db)?;
-    // A row whose pid is gone is not a held lock — `acquire_writer_lock`
-    // reclaims it without a word, so reporting it here would send the user
-    // hunting for a scan that already ended.
     if let Some(pid) = holder.filter(|p| db::pid_alive(*p)) {
         println!("writer  pid {pid} holds the write lock");
     }
 
+    let bases = base_rows(&conn)?;
+    if bases.is_empty() {
+        println!("no bases yet — `ingest <base-path>` creates one");
+        return Ok(EXIT_OK);
+    }
+    for b in &bases {
+        report_base(&conn, &config, b)?;
+    }
+    Ok(EXIT_OK)
+}
+
+/// One row of the `status` base listing. A named struct rather than the tuple
+/// it used to be: eight positional fields were unreadable at the use site and
+/// tripped clippy's complex-type lint.
+struct BaseRow {
+    base_id: i64,
+    base_path: String,
+    skip_hidden: bool,
+    skip_mount_boundaries: bool,
+    follow_symlinks: bool,
+    baseline_scan_id: Option<i64>,
+    baseline_finished_ns: Option<i64>,
+    present_count: Option<i64>,
+}
+
+fn base_rows(conn: &rusqlite::Connection) -> Result<Vec<BaseRow>, AppError> {
     let mut stmt = conn
         .prepare(
             "SELECT b.base_id, b.base_path, b.skip_hidden, b.skip_mount_boundaries,
@@ -214,72 +238,84 @@ fn status() -> Result<i32, AppError> {
              ORDER BY b.base_id",
         )
         .map_err(AppError::db)?;
-    let bases: Vec<(i64, String, bool, bool, bool, Option<i64>, Option<i64>, Option<i64>)> = stmt
+    let rows = stmt
         .query_map([], |r| {
-            Ok((
-                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
-                r.get(5)?, r.get(6)?, r.get(7)?,
-            ))
+            Ok(BaseRow {
+                base_id: r.get(0)?,
+                base_path: r.get(1)?,
+                skip_hidden: r.get(2)?,
+                skip_mount_boundaries: r.get(3)?,
+                follow_symlinks: r.get(4)?,
+                baseline_scan_id: r.get(5)?,
+                baseline_finished_ns: r.get(6)?,
+                present_count: r.get(7)?,
+            })
         })
         .map_err(AppError::db)?
         .collect::<Result<_, _>>()
         .map_err(AppError::db)?;
+    Ok(rows)
+}
 
-    if bases.is_empty() {
-        println!("no bases yet — `ingest <base-path>` creates one");
-        return Ok(EXIT_OK);
+fn report_base(
+    conn: &rusqlite::Connection,
+    config: &Config,
+    b: &BaseRow,
+) -> Result<(), AppError> {
+    use rusqlite::OptionalExtension;
+
+    println!("base    {}", b.base_path);
+    match (b.baseline_scan_id, b.baseline_finished_ns) {
+        (Some(id), Some(ns)) => println!(
+            "  baseline  scan {id}, {} ago, {} file(s) present",
+            ago(ns),
+            b.present_count.unwrap_or(0)
+        ),
+        _ => println!("  baseline  none — no scan has completed yet"),
     }
 
-    for (base_id, base_path, hidden, mounts, symlinks, scan_id, finished, present) in bases {
-        println!("base    {base_path}");
-        match (scan_id, finished) {
-            (Some(id), Some(ns)) => println!(
-                "  baseline  scan {id}, {} ago, {} file(s) present",
-                ago(ns),
-                present.unwrap_or(0)
-            ),
-            _ => println!("  baseline  none — no scan has completed yet"),
-        }
-
-        // Must mirror the resumable query in `scan::ingest`, or status would
-        // promise a resume the scanner does not perform.
-        let resumable: Option<(i64, String, i64)> = conn
-            .query_row(
-                "SELECT scan_id, status, started_at_ns FROM scans
-                 WHERE base_id = ?1 AND status IN ('running','cancelled','failed','partial')
-                 ORDER BY scan_id DESC LIMIT 1",
-                rusqlite::params![base_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()
-            .map_err(AppError::db)?;
-        match resumable {
-            Some((id, st, started)) => println!(
-                "  resumable scan {id} ({st}, started {} ago) — `ingest {base_path}` continues it",
-                ago(started)
-            ),
-            None => println!("  resumable none"),
-        }
-
-        // The exact comparison behind EXIT_POLICY, surfaced before it refuses.
-        let mut differs = Vec::new();
-        if hidden != config.skip_hidden {
-            differs.push("skip_hidden");
-        }
-        if mounts != config.skip_mount_boundaries {
-            differs.push("skip_mount_boundaries");
-        }
-        if symlinks != config.follow_symlinks {
-            differs.push("follow_symlinks");
-        }
-        if !differs.is_empty() {
-            println!(
-                "  POLICY    {} differ(s) from this baseline; `ingest` will refuse (exit {EXIT_POLICY})",
-                differs.join(", ")
-            );
-        }
+    // Must mirror the resumable query in `scan::open_scan`, or status would
+    // promise a resume the scanner does not perform.
+    let resumable: Option<(i64, String, i64)> = conn
+        .query_row(
+            "SELECT scan_id, status, started_at_ns FROM scans
+             WHERE base_id = ?1 AND status IN ('running','cancelled','failed','partial')
+             ORDER BY scan_id DESC LIMIT 1",
+            rusqlite::params![b.base_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(AppError::db)?;
+    match resumable {
+        Some((id, st, started)) => println!(
+            "  resumable scan {id} ({st}, started {} ago) — `ingest {}` continues it",
+            ago(started),
+            b.base_path
+        ),
+        None => println!("  resumable none"),
     }
-    Ok(EXIT_OK)
+
+    // The exact comparison behind EXIT_POLICY, surfaced before it refuses.
+    let differs: Vec<&str> = [
+        ("skip_hidden", b.skip_hidden, config.skip_hidden),
+        (
+            "skip_mount_boundaries",
+            b.skip_mount_boundaries,
+            config.skip_mount_boundaries,
+        ),
+        ("follow_symlinks", b.follow_symlinks, config.follow_symlinks),
+    ]
+    .into_iter()
+    .filter(|(_, was, now)| was != now)
+    .map(|(name, _, _)| name)
+    .collect();
+    if !differs.is_empty() {
+        println!(
+            "  POLICY    {} differ(s) from this baseline; `ingest` will refuse (exit {EXIT_POLICY})",
+            differs.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Coarse on purpose: status answers "recent or stale?", not "when exactly?".
