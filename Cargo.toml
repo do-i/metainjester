@@ -1,7 +1,7 @@
 [package]
 name = "metainjester"
 # Calendar versioning: year.month.sequence. The release tag must match exactly.
-version = "2026.8.1"
+version = "2026.8.2"
 edition = "2024"
 description = "Catalogues a directory tree into SQLite and reports what changed on later runs"
 license = "MIT"
