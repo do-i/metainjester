@@ -60,6 +60,26 @@ pub struct Walker<'a> {
     downstream_gone: bool,
 }
 
+/// A directory whose descent is deferred until the parent's `ReadDir` has been
+/// dropped. Only the two identity fields `enter_dir` needs are kept — holding a
+/// `DirEntry` instead would keep the parent's handle alive through the `Arc`
+/// inside it, which is the whole thing this defers to avoid.
+struct Pending {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl Pending {
+    fn new(path: PathBuf, meta: &std::fs::Metadata) -> Pending {
+        Pending {
+            path,
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+}
+
 impl<'a> Walker<'a> {
     pub fn new(
         base: &'a Path,
@@ -122,6 +142,13 @@ impl<'a> Walker<'a> {
             Err(e) => return self.send_err(dir, &e),
         };
 
+        // Files are emitted inline but directories are only remembered, so that
+        // `entries` — this level's open directory handle — is dropped before the
+        // first recursive call. Descending inside the loop instead would hold one
+        // descriptor per level and hit EMFILE on a deep tree, abandoning the rest
+        // of it. Open descriptors are now O(1) in depth; the cost is one `Pending`
+        // per subdirectory of the levels on the current path.
+        let mut pending: Vec<Pending> = Vec::new();
         for entry in entries {
             if self.should_stop() {
                 return;
@@ -151,23 +178,32 @@ impl<'a> Walker<'a> {
             };
 
             if meta.file_type().is_symlink() {
-                self.visit_symlink(&path);
+                self.visit_symlink(&path, &mut pending);
             } else if meta.is_dir() {
-                self.enter_dir(&path, &meta);
+                pending.push(Pending::new(path, &meta));
             } else if meta.is_file() {
                 self.visit_file(&path, &meta);
             }
             // Sockets, FIFOs, and devices are not eligible regular files.
         }
+
+        for sub in pending {
+            if self.should_stop() {
+                return;
+            }
+            self.enter_dir(&sub);
+        }
     }
 
-    fn visit_symlink(&mut self, path: &Path) {
+    fn visit_symlink(&mut self, path: &Path, pending: &mut Vec<Pending>) {
         if !self.config.follow_symlinks {
             self.counts.symlink.fetch_add(1, Ordering::Relaxed);
             return;
         }
         match std::fs::metadata(path) {
-            Ok(target) if target.is_dir() => self.enter_dir(path, &target),
+            Ok(target) if target.is_dir() => {
+                pending.push(Pending::new(path.to_path_buf(), &target))
+            }
             // Deliberately not `visit_file`: a followed symlink to a file has
             // never been subject to the mount check, only one to a directory
             // has. Preserved as-is rather than quietly widening exclusion.
@@ -185,17 +221,17 @@ impl<'a> Walker<'a> {
         self.emit(path, meta);
     }
 
-    fn enter_dir(&mut self, path: &Path, meta: &std::fs::Metadata) {
-        if self.crosses_mount(meta) {
+    fn enter_dir(&mut self, sub: &Pending) {
+        if self.config.skip_mount_boundaries && sub.dev != self.base_dev {
             self.counts.mount.fetch_add(1, Ordering::Relaxed);
             return;
         }
         // Only needed when following symlinks, which is the one way a walk can
         // revisit a directory and loop forever.
-        if self.config.follow_symlinks && !self.visited_dirs.insert((meta.dev(), meta.ino())) {
+        if self.config.follow_symlinks && !self.visited_dirs.insert((sub.dev, sub.ino)) {
             return;
         }
-        self.walk(path);
+        self.walk(&sub.path);
     }
 
     fn crosses_mount(&self, meta: &std::fs::Metadata) -> bool {

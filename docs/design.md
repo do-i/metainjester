@@ -40,6 +40,12 @@ Each has a reason that is easy to forget and expensive to rediscover.
 - **Never use a directory's mtime to skip a subtree.** Editing a file does not
   change its parent's mtime, so an ancestor timestamp cannot prove a subtree
   unchanged. Timestamps may prioritise work; they may never skip it.
+- **Traversal holds one directory handle, not one per level.** Descending while
+  the parent's `ReadDir` is still alive costs a descriptor per level and hits
+  `EMFILE` on a deep tree, silently abandoning everything below it while the scan
+  still reports `complete`. Each level collects its subdirectories, drops the
+  handle, then descends. Keeping a `DirEntry` instead would defeat this — it
+  holds an `Arc` to the open directory.
 - **Hash reuse requires exact equality of path, size, and nanosecond mtime.**
   Accepted edge case: a restored timestamp can hide a content change.
 - **Renames are `deleted` + `added`.** A content-hash match is not proof of a

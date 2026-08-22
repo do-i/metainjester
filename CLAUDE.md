@@ -122,7 +122,9 @@ change is refused with `policy_mismatch`; foreign and other-application database
 directory are refused; a stale writer lock from a dead pid is reclaimed; mount
 boundaries skipped and crossed per policy (verified under `unshare -rm`);
 symlink loops terminate; rename yields `deleted` + `added`; hidden entries and
-symlinks excluded by count only.
+symlinks excluded by count only; a tree 1,244 directories deep is catalogued in
+full at `ulimit -n 64`, descriptors being bounded by one handle rather than one
+per level.
 
 ## Next
 
