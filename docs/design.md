@@ -34,6 +34,16 @@ Each has a reason that is easy to forget and expensive to rediscover.
   permission and rerunning must land exactly where a readable first scan would
   have. Only an unreadable *base* refuses to promote, because it prefixes every
   path and puts the whole baseline in doubt at once.
+- **A directory that could not be listed is reported, never absorbed.** Every
+  other count describes something the scan saw; this one describes what it did
+  not, and its size is unknowable — the files under it were never enumerated, so
+  nothing downstream can count them. It still promotes, because one unreadable
+  directory must not cost a whole tree its scan and the rows beneath it are
+  shielded regardless. It exits `7` so that "I catalogued everything" is never
+  said on a scan with a hole in it.
+- **Inclusion policy applies however a path was reached.** A followed symlink to
+  a file goes through the same mount check as a real file. Otherwise the same
+  file is included or excluded depending on the route taken to it.
 - **Inclusion policy must match the baseline or the rescan refuses.** If a prior
   scan included `.cache` and the config now skips hidden files, every hidden path
   would look deleted. This is why the three policy fields are stored per base.

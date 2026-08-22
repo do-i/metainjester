@@ -23,6 +23,11 @@ const EXIT_CONFIG: i32 = 3;
 const EXIT_BUSY: i32 = 4;
 const EXIT_NO_SPACE: i32 = 5;
 const EXIT_POLICY: i32 = 6;
+/// Promoted, but the walk could not list one or more directories, so the
+/// catalogue has a hole of unknown size. Distinct from `EXIT_ERROR` because the
+/// scan did succeed and the baseline did move; distinct from `EXIT_OK` because
+/// "I catalogued everything" would be a lie.
+const EXIT_INCOMPLETE: i32 = 7;
 const EXIT_CANCELLED: i32 = 130;
 
 pub struct AppError {
@@ -143,6 +148,9 @@ fn run() -> Result<i32, AppError> {
 
     report(&opened.path, &base, &config, &outcome);
     Ok(match outcome.status {
+        // Silence here was the whole failure mode: a scan that never saw part of
+        // the tree used to be indistinguishable from one that saw all of it.
+        "complete" if outcome.unreadable_dirs > 0 => EXIT_INCOMPLETE,
         "complete" => EXIT_OK,
         "cancelled" => EXIT_CANCELLED,
         // Stopping at the floor is the same condition as refusing at the floor,
@@ -459,6 +467,18 @@ fn report(db_path: &std::path::Path, base: &std::path::Path, config: &Config, o:
             println!(
                 "pruned  {} change row(s), {} dead file row(s) (history.keep_scans = {})",
                 o.pruned_changes, o.pruned_files, config.keep_scans
+            );
+        }
+        // The one error worth its own heading: every other count above describes
+        // something the scan saw, while this describes what it did not.
+        if o.unreadable_dirs > 0 {
+            println!(
+                "gaps    {} directory listing(s) failed — those contents are NOT catalogued",
+                o.unreadable_dirs
+            );
+            println!(
+                "        {} baseline row(s) beneath them held 'unreadable', not deleted (exit {EXIT_INCOMPLETE})",
+                o.unreadable
             );
         }
         // Deliberately a count, not a list: a permission slip can cover a large

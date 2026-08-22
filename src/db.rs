@@ -9,7 +9,7 @@ use crate::AppError;
 
 pub const CWD_DB: &str = "metainjester.sqlite3";
 pub const APPLICATION_ID: &str = "metainjester";
-pub const SCHEMA_VERSION: &str = "2";
+pub const SCHEMA_VERSION: &str = "3";
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS application_metadata (
@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS scans (
     excluded_hidden  INTEGER NOT NULL DEFAULT 0,
     excluded_mount   INTEGER NOT NULL DEFAULT 0,
     excluded_symlink INTEGER NOT NULL DEFAULT 0,
+    unreadable_dirs  INTEGER NOT NULL DEFAULT 0,
     free_bytes_before   INTEGER,
     free_bytes_after    INTEGER,
     required_free_bytes INTEGER,

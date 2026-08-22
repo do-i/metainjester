@@ -50,9 +50,9 @@ write `scan_changes`, upsert `files`, mark absences under an unreadable path
 `bases.last_complete_scan_id`, drain staging. Anything else keeps its staging and
 leaves the baseline untouched, and the next `ingest` on that base resumes it.
 
-File-level errors do not block promotion. `permission_denied`, `io_error`, and
-`invalid_data` (`walk::UNREADABLE_CODES`) shield the failing path and everything
-beneath it from deletion — the byte-wise prefix test in `scan::shielded`, never
+File-level errors do not block promotion. `permission_denied`, `io_error`, `invalid_data`, and
+`resource_exhausted` (`walk::UNREADABLE_CODES`) shield the failing path and
+everything beneath it from deletion — the byte-wise prefix test in `scan::shielded`, never
 string concatenation, since `relative_path` is a BLOB. An unreadable base is the
 exception and yields `partial` / `base_unreadable`: it prefixes every path, so
 nothing can be shielded. `unreadable` rows return to `present` on a scan that can
@@ -71,19 +71,28 @@ fatal. `unreadable` rows are never pruned; `scans` rows are always kept, which i
 what keeps it FK-safe. Deletes are batched at `writer_batch_rows`. Pruning frees
 pages for reuse but does not shrink the file — that needs `VACUUM INTO`.
 
+A directory the walk could not list is the one error that hides an unknown
+quantity — nothing can count what was never enumerated. Those are tallied in
+`scans.unreadable_dirs`, reported under a `gaps` heading, and exit `7`. The scan
+still promotes: one unreadable directory must not hold a whole tree hostage, and
+its rows are shielded anyway. What it must not do is look identical to a scan
+that saw everything.
+
 Exit codes: `0` ok, `1` error/partial, `2` usage, `3` config, `4` busy,
-`5` no space, `6` policy mismatch, `130` cancelled.
+`5` no space, `6` policy mismatch, `7` promoted with unlisted directories,
+`130` cancelled.
 
 ### Schema v1
 
 ```sql
-application_metadata(key, value)          -- application_id, schema_version = 2
+application_metadata(key, value)          -- application_id, schema_version = 3
 writer_lock(id, pid, acquired_at_ns)
 bases(base_id, base_path, created_at_ns, last_complete_scan_id,
       skip_hidden, skip_mount_boundaries, follow_symlinks, last_error)
 scans(scan_id, base_id, baseline_scan_id, status, started/finished_at_ns,
       <policy + workers/batch/throttle/hash_policy>, <work totals>,
-      <outcome counts>, <exclusion counts>, <capacity>, failure_code/message)
+      <outcome counts>, <exclusion counts>, unreadable_dirs, <capacity>,
+      failure_code/message)
   status: running | complete | partial | cancelled | failed
 files(file_id, base_id, relative_path, parent_path, name, extension, presence,
       size_bytes, mtime_ns, created_ns, mime_type, mime_source,

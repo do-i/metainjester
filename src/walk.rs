@@ -45,6 +45,10 @@ pub struct Counters {
     pub reused_stage: AtomicU64,
     pub reused_baseline: AtomicU64,
     pub changed_during_hash: AtomicU64,
+    /// Directories whose listing failed. Counted apart from every other error
+    /// because it is the only one that hides an unknown quantity: nothing
+    /// downstream can count files that were never enumerated.
+    pub unreadable_dirs: AtomicU64,
 }
 
 pub struct Walker<'a> {
@@ -129,6 +133,16 @@ impl<'a> Walker<'a> {
         });
     }
 
+    /// A directory that could not be listed, in whole or in part. Tallied on top
+    /// of the ordinary error row so that a scan can say how much of the tree it
+    /// never saw, rather than reporting a clean `complete` over a hole.
+    fn unlistable(&mut self, dir: &Path, e: &std::io::Error) {
+        if UNREADABLE_CODES.contains(&error_code(e)) {
+            self.counts.unreadable_dirs.fetch_add(1, Ordering::Relaxed);
+        }
+        self.send_err(dir, e);
+    }
+
     fn should_stop(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed) || self.downstream_gone
     }
@@ -139,7 +153,7 @@ impl<'a> Walker<'a> {
         }
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
-            Err(e) => return self.send_err(dir, &e),
+            Err(e) => return self.unlistable(dir, &e),
         };
 
         // Files are emitted inline but directories are only remembered, so that
@@ -156,7 +170,9 @@ impl<'a> Walker<'a> {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    self.send_err(dir, &e);
+                    // Mid-iteration failure: this directory is only partly
+                    // enumerated, so it counts as a gap just like a failed open.
+                    self.unlistable(dir, &e);
                     continue;
                 }
             };
@@ -204,10 +220,11 @@ impl<'a> Walker<'a> {
             Ok(target) if target.is_dir() => {
                 pending.push(Pending::new(path.to_path_buf(), &target))
             }
-            // Deliberately not `visit_file`: a followed symlink to a file has
-            // never been subject to the mount check, only one to a directory
-            // has. Preserved as-is rather than quietly widening exclusion.
-            Ok(target) if target.is_file() => self.emit(path, &target),
+            // `visit_file`, not `emit`, so the mount check applies however the
+            // file was reached. Following a symlink used to bypass it, which let
+            // a link to another filesystem in while the very file it pointed at
+            // was excluded.
+            Ok(target) if target.is_file() => self.visit_file(path, &target),
             Ok(_) => {}
             Err(e) => self.send_err(path, &e),
         }
@@ -266,9 +283,24 @@ pub fn system_time_ns(t: Option<std::time::SystemTime>) -> Option<i64> {
 /// while a path that merely vanished leaves nothing in doubt and must not hold
 /// the whole scan hostage. The base itself is judged differently — see
 /// `scan::base_unreadable`.
-pub const UNREADABLE_CODES: [&str; 3] = ["permission_denied", "io_error", "invalid_data"];
+pub const UNREADABLE_CODES: [&str; 4] = [
+    "permission_denied",
+    "io_error",
+    "invalid_data",
+    "resource_exhausted",
+];
 
 pub fn error_code(e: &std::io::Error) -> &'static str {
+    // EMFILE/ENFILE are this process running out of descriptors, not anything
+    // about the path. Contents are still unknown so it shields like the rest,
+    // but it is the only unreadable code a rerun can clear with nothing on disk
+    // having changed, which is worth being able to see in `scan_errors`.
+    let raw = e.raw_os_error();
+    if raw == Some(rustix::io::Errno::MFILE.raw_os_error())
+        || raw == Some(rustix::io::Errno::NFILE.raw_os_error())
+    {
+        return "resource_exhausted";
+    }
     match e.kind() {
         std::io::ErrorKind::NotFound => "not_found",
         std::io::ErrorKind::PermissionDenied => "permission_denied",

@@ -91,6 +91,9 @@ pub struct Outcome {
     pub pruned_files: u64,
     pub unreadable: usize,
     pub unreadable_paths: usize,
+    /// Directories this scan could not list. Non-zero means the catalogue has a
+    /// hole of unknown size, which is not something the other counts can show.
+    pub unreadable_dirs: u64,
     pub discovered_bytes: u64,
     pub excluded_hidden: u64,
     pub excluded_mount: u64,
@@ -400,7 +403,7 @@ fn record_walk_totals(
              staged_bytes = ?12,
              hashed_files = ?4, hashed_bytes = ?5, changed_during_hash = ?6,
              excluded_hidden = ?7, excluded_mount = ?8, excluded_symlink = ?9,
-             error_count = ?10
+             error_count = ?10, unreadable_dirs = ?13
          WHERE scan_id = ?11",
         params![
             counts.discovered_files.load(Ordering::Relaxed) as i64,
@@ -414,7 +417,8 @@ fn record_walk_totals(
             counts.symlink.load(Ordering::Relaxed) as i64,
             errors as i64,
             scan_id,
-            staged_bytes
+            staged_bytes,
+            counts.unreadable_dirs.load(Ordering::Relaxed) as i64
         ],
     )
     .map_err(AppError::db)?;
@@ -450,6 +454,7 @@ fn new_outcome(
         pruned_files: 0,
         unreadable: 0,
         unreadable_paths: 0,
+        unreadable_dirs: counts.unreadable_dirs.load(Ordering::Relaxed),
         discovered_bytes: counts.discovered_bytes.load(Ordering::Relaxed),
         excluded_hidden: counts.hidden.load(Ordering::Relaxed),
         excluded_mount: counts.mount.load(Ordering::Relaxed),
