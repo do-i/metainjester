@@ -210,8 +210,11 @@ unverified now.
 
 ## Working rules
 
-- POC first: lean, small, just works. **No README, no tests yet** — added after
-  the user verifies behavior.
+- POC first: lean, small, just works. **No README.** Tests exist now that the
+  user has verified behaviour: `cargo test` runs unit tests for the pure helpers
+  in `walk.rs` and `tests/cli.rs`, which drives the real binary against a
+  throwaway `HOME` and database per test. A behaviour worth a paragraph in this
+  file is worth a test.
 - Keep replies and files short. Reading is the user's bottleneck.
 - One-line git commit messages, no trailers.
 - Schema changes just recreate the database; no migrations yet. **Bump

@@ -350,3 +350,85 @@ pub fn helpers(rel: &[u8]) -> Helpers {
         mime_source,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(raw: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(raw)
+    }
+
+    #[test]
+    fn descriptor_exhaustion_has_its_own_code() {
+        let mfile = rustix::io::Errno::MFILE.raw_os_error();
+        let nfile = rustix::io::Errno::NFILE.raw_os_error();
+        assert_eq!(error_code(&err(mfile)), "resource_exhausted");
+        assert_eq!(error_code(&err(nfile)), "resource_exhausted");
+    }
+
+    /// Running out of descriptors leaves a directory's contents just as unknown
+    /// as a permission denial does, so it must shield the baseline beneath it.
+    #[test]
+    fn every_unknown_contents_code_shields() {
+        assert!(UNREADABLE_CODES.contains(&"resource_exhausted"));
+        assert!(UNREADABLE_CODES.contains(&"permission_denied"));
+        assert!(UNREADABLE_CODES.contains(&"io_error"));
+        assert!(UNREADABLE_CODES.contains(&"invalid_data"));
+        // A path that merely vanished is not in doubt and must never shield.
+        assert!(!UNREADABLE_CODES.contains(&"not_found"));
+    }
+
+    #[test]
+    fn vanished_and_denied_keep_their_own_codes() {
+        let denied = rustix::io::Errno::ACCESS.raw_os_error();
+        let missing = rustix::io::Errno::NOENT.raw_os_error();
+        assert_eq!(error_code(&err(denied)), "permission_denied");
+        assert_eq!(error_code(&err(missing)), "not_found");
+    }
+
+    #[test]
+    fn helpers_split_parent_from_name() {
+        let h = helpers(b"a/b/c.txt");
+        assert_eq!(h.parent.as_deref(), Some("a/b"));
+        assert_eq!(h.name, "c.txt");
+        assert_eq!(h.extension.as_deref(), Some("txt"));
+
+        let top = helpers(b"c.txt");
+        assert_eq!(top.parent, None);
+        assert_eq!(top.name, "c.txt");
+    }
+
+    /// `Path::extension` semantics, which the helper columns have to match or a
+    /// query on `extension` disagrees with the MIME guess beside it.
+    #[test]
+    fn extension_follows_path_semantics() {
+        assert_eq!(helpers(b".bashrc").extension, None, "leading dot is a stem");
+        assert_eq!(helpers(b"trailing.").extension, None, "trailing dot is not an extension");
+        assert_eq!(helpers(b"none").extension, None);
+        assert_eq!(helpers(b"a.TXT").extension.as_deref(), Some("txt"), "lowercased");
+        assert_eq!(helpers(b"a.tar.gz").extension.as_deref(), Some("gz"));
+    }
+
+    #[test]
+    fn mime_comes_from_extension_only() {
+        let h = helpers(b"x/y.png");
+        assert_eq!(h.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(h.mime_source, "extension");
+
+        let unknown = helpers(b"x/y.zzzzz");
+        assert_eq!(unknown.mime_type, None);
+        assert_eq!(unknown.mime_source, "unknown");
+    }
+
+    /// `relative_path` is BINARY; the helper columns are a lossy convenience.
+    /// A name that is not valid UTF-8 must still produce usable helpers rather
+    /// than panicking or dropping the row.
+    #[test]
+    fn helpers_survive_non_utf8_names() {
+        let h = helpers(b"dir/bad\xff.txt");
+        assert_eq!(h.parent.as_deref(), Some("dir"));
+        assert!(h.name.ends_with(".txt"));
+        assert_eq!(h.extension.as_deref(), Some("txt"));
+    }
+}

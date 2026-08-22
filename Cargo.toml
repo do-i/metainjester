@@ -15,3 +15,9 @@ rustix = { version = "1.1.4", features = ["fs"] }
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.0"
 toml = "1.1.4"
+
+# Integration tests drive the built binary and then read the database it wrote.
+# rusqlite is already a runtime dependency, so this adds nothing to the lock's
+# package set and nothing to a `--frozen` release build.
+[dev-dependencies]
+rusqlite = "0.40.1"
